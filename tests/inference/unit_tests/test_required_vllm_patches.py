@@ -4,6 +4,7 @@ from arctic_platform.inference.vllm import glm5next_indexer_page
 from arctic_platform.inference.vllm import required_patches
 from arctic_platform.inference.vllm import router_replay
 from arctic_platform.inference.vllm import spec_decode_grammar
+from arctic_platform.inference.vllm import tp_spec_decode_sync
 from arctic_platform.inference.vllm import xgrammar_stop_mask
 
 
@@ -35,6 +36,11 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         lambda: calls.append("dflash2"),
     )
     monkeypatch.setattr(
+        tp_spec_decode_sync,
+        "ensure_tp_spec_decode_sync",
+        lambda: calls.append("tp_spec_decode_sync"),
+    )
+    monkeypatch.setattr(
         glm5next_indexer_page,
         "apply_glm5next_indexer_page_fix",
         lambda: calls.append("glm5next_indexer_page"),
@@ -48,5 +54,6 @@ def test_required_vllm_patches_are_applied_together(monkeypatch):
         "dense_prompt_logprobs",
         "spec_decode_grammar",
         "dflash2",
+        "tp_spec_decode_sync",
         "glm5next_indexer_page",
     ]
