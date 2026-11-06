@@ -6,6 +6,7 @@ writers/updaters used by both sender and receiver code paths.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import struct
@@ -72,7 +73,15 @@ def stateless_init_nccl(master_addr, master_port, rank, world_size, device,
             data_expiration_seconds=3600,
         )
 
-    return PyNcclCommunicator(pg, device=device)
+    try:
+        from vllm.utils.nccl import unpinned_nccl_env
+    except ImportError:
+        unpinned_nccl_env = contextlib.nullcontext
+    # VLLM_BATCH_INVARIANT=1 pins NCCL channels, protocol and algorithms for the
+    # engine's own communicators. This one is shared with a trainer that runs
+    # NCCL's defaults, and NCCL hangs when the two ends disagree.
+    with unpinned_nccl_env():
+        return PyNcclCommunicator(pg, device=device)
 
 
 # ---------------------------------------------------------------------------
