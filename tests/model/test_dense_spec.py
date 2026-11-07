@@ -138,12 +138,14 @@ def test_loader_options_are_validated_by_the_huggingface_schema():
         "fp32_residual": False,
         "vllm_aligned": False,
         "vllm_aligned_tensor_parallel": 1,
+        "vllm_aligned_prefill_chunk": 0,
     }
     assert residual_on.loader_options == {
         "fp32_parity": True,
         "fp32_residual": True,
         "vllm_aligned": False,
         "vllm_aligned_tensor_parallel": 1,
+        "vllm_aligned_prefill_chunk": 0,
     }
     with pytest.raises(ValidationError, match="fp32_residual requires fp32_parity"):
         _spec(loader_options={"fp32_parity": False, "fp32_residual": True})
