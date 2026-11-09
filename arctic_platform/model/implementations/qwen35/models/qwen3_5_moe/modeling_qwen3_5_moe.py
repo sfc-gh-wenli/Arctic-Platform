@@ -993,8 +993,14 @@ class Qwen3_5MoeVLMModel(nn.Module):
 
         if pixel_values is not None:
             pixel_values = pixel_values.type(self.visual.dtype)
-            vision_output = self.visual(pixel_values, grid_thw=image_grid_thw, return_dict=True)
-            image_embeds = vision_output.pooler_output.to(inputs_embeds.device, inputs_embeds.dtype)
+            # Debug image variant: encode each image alone, so its embeddings do not depend on the other images.
+            patches = image_grid_thw.prod(dim=-1).tolist()
+            image_embeds = torch.cat(
+                [
+                    self.visual(values, grid_thw=grid[None], return_dict=True).pooler_output
+                    for values, grid in zip(pixel_values.split(patches), image_grid_thw)
+                ]
+            ).to(inputs_embeds.device, inputs_embeds.dtype)
 
             image_mask = input_ids == self.config.image_token_id
             image_tokens = int(image_mask.sum())
