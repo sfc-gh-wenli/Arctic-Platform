@@ -79,6 +79,9 @@ except ImportError:
 
 logger = logging.get_logger(__name__)
 
+# Debug-only image variant: image tokens rotate by 1-D positions, for an M-RoPE A/B.
+_DEBUG_FORCE_1D_ROPE = True
+
 
 # ---------------------------------------------------------------------------
 # RMSNorm variants
@@ -1010,7 +1013,7 @@ class Qwen3_5MoeVLMModel(nn.Module):
 
         # Text-only rows rotate identically under 1-D RoPE, so M-RoPE positions are only built for images.
         mrope_position_ids = None
-        if image_grid_thw is not None:
+        if image_grid_thw is not None and not _DEBUG_FORCE_1D_ROPE:
             mrope_position_ids = compute_mrope_position_ids(
                 input_ids,
                 position_ids,
