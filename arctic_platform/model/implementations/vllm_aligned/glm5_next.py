@@ -274,8 +274,6 @@ def indexer_topk(indexer: Any, x: torch.Tensor, q_c: torch.Tensor, positions: to
     long_rows = torch.nonzero(positions >= topk_tokens).flatten()
     if long_rows.numel() == 0:
         return out
-    if prompt_lens is not None and bool((positions[long_rows] >= prompt_lens[_sequence_of_tokens(cu_seqlens)[long_rows]]).any()):
-        raise NotImplementedError("vLLM-aligned sparse indexer: decoded tokens at or past index_topk (not in yet)")
     if getattr(config, "index_rope_head_dim", 0) or getattr(config, "qk_rope_head_dim", 0):
         raise NotImplementedError("vLLM-aligned sparse indexer covers mla_use_nope (no rotary embedding)")
     tokens = x.shape[0]
