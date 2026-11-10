@@ -271,7 +271,8 @@ def _kda_core_kernel(q, k, v, g, beta, a_log, dt_bias, *, layout: Any, lower_bou
 def _gated_norm_kernel(x: torch.Tensor, g: torch.Tensor, weight: torch.Tensor, *, eps: float) -> torch.Tensor:
     from vllm.third_party.flash_linear_attention.ops.kda import rms_norm_gated
 
-    return rms_norm_gated(x, g, weight, None, "sigmoid", eps=eps)
+    # It writes its output over a contiguous ``x``; the per-op backward keeps ``x`` for the reference.
+    return rms_norm_gated(x.clone(), g, weight, None, "sigmoid", eps=eps)
 
 
 def kda_prefill(attn: Any, x: torch.Tensor, cu_seqlens: torch.Tensor, config: Any, trace: dict | None = None) -> torch.Tensor:
