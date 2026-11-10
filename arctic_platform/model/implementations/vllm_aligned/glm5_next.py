@@ -252,7 +252,7 @@ INDEXER_PADDED_HEADS = 32
 
 
 def indexer_topk(indexer: Any, x: torch.Tensor, q_c: torch.Tensor, positions: torch.Tensor, cu_seqlens: torch.Tensor,
-                 config: Any, width: int, prompt_lens: torch.Tensor | None = None) -> torch.Tensor:  # fmt: skip
+                 config: Any, width: int) -> torch.Tensor:  # fmt: skip
     """vLLM's kpool sparse-indexer top-k for whole prompts: ``[tokens, width]`` request-relative token ids, ``-1`` padded.
 
     A token whose position is below ``index_topk`` gets its causal row (every earlier token). The others score the
@@ -261,6 +261,9 @@ def indexer_topk(indexer: Any, x: torch.Tensor, q_c: torch.Tensor, positions: to
     batch-invariant matmul, the key LayerNorm, the Hadamard-rotated FP8 query, the softmax(gate + ape)-weighted pool
     compression to FP8, DeepGEMM's FP8 MQA logits, the deterministic top ``index_topk // index_kpool`` pools, and
     their expansion to tokens with the incomplete pool's tail appended.
+
+    A decoded token gets the same row: the sampler's decode step compresses each pool with the same arithmetic on
+    the same bf16 keys and scores, and its paged FP8 MQA logits equal the prefill kernel's.
     """
     import torch.nn.functional as F
     from vllm.models.glm5next.nvidia.ops import kpool_compress as kpool_ops
@@ -347,11 +350,12 @@ def bf16_weight(linear: Any) -> torch.Tensor:
 
 
 def mla_attention(attn: Any, x: torch.Tensor, positions: torch.Tensor, cu_seqlens: torch.Tensor,
-                  config: Any, prompt_lens: torch.Tensor | None = None, record: dict | None = None) -> torch.Tensor:  # fmt: skip
-    """vLLM's ``Glm5NextMLAAttention`` (sparse MLA with ``mla_use_nope``) on prompts no longer than ``index_topk``.
+                  config: Any, record: dict | None = None) -> torch.Tensor:  # fmt: skip
+    """vLLM's ``Glm5NextMLAAttention`` (sparse MLA with ``mla_use_nope``) on packed requests.
 
-    Such prompts take vLLM's short-prefill path: every token attends to all earlier tokens of its request, with no
-    indexer scoring. With ``mla_use_nope`` vLLM skips the rotary embedding and pads ``kv_a_proj_with_mqa`` with
+    Each token attends to the rows :func:`indexer_topk` selects (every earlier token below ``index_topk``, the
+    indexer's pools from there on); ``record`` keeps them for the backward's stock recompute. With ``mla_use_nope``
+    vLLM skips the rotary embedding and pads ``kv_a_proj_with_mqa`` with
     zero rows up to ``kv_lora_rank + qk_rope_head_dim``, so the rope part of every key is zero. The block-FP8
     ``q_a``/``kv_a``/``q_b``/``o`` projections are dequantized to bf16 as vLLM does at load. Then: the merged
     ``[q_a; kv_a]`` projection, the fused q/kv RMSNorm, ``q_b_proj``, the query absorbed into the latent space by
@@ -384,7 +388,7 @@ def mla_attention(attn: Any, x: torch.Tensor, positions: torch.Tensor, cu_seqlen
     torch.bmm(q_nope.transpose(0, 1), w_uk_t, out=q_latent.transpose(0, 1))
 
     seq_of_token = torch.repeat_interleave(torch.arange(starts.numel(), device=x.device), lengths)
-    topk = indexer_topk(attn.indexer, x, q_c, positions, cu_seqlens, config, topk_buffer_width(config), prompt_lens)
+    topk = indexer_topk(attn.indexer, x, q_c, positions, cu_seqlens, config, topk_buffer_width(config))
     rows = torch.where(topk >= 0, topk + starts.to(torch.int32)[seq_of_token, None], topk)
     if record is not None:
         record["topk"] = rows
@@ -418,8 +422,7 @@ def _mixer(layer: Any, x: torch.Tensor, ctx: Any) -> torch.Tensor:
     prompt_lens = getattr(ctx, "prompt_lens", None)
     if layer.block_type == "linear_attention":
         return kda_forward(layer.self_attn, x, ctx.cu_seqlens, ctx.config, prompt_lens)
-    return mla_attention(layer.self_attn, x, ctx.positions, ctx.cu_seqlens, ctx.config, prompt_lens,
-                         _record(ctx, layer))  # fmt: skip
+    return mla_attention(layer.self_attn, x, ctx.positions, ctx.cu_seqlens, ctx.config, _record(ctx, layer))
 
 
 def fp8_block_linear(x: torch.Tensor, weight: torch.Tensor, weight_scale_inv: torch.Tensor) -> torch.Tensor:
