@@ -1214,6 +1214,36 @@ def prompt_lengths(trained: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Ten
     return torch.minimum(first + 1, lengths)
 
 
+def _log_memory(model: Any, tokens: int) -> None:
+    """Debug (the experimental per-op backward): rank 0's CUDA memory at each aligned forward, and the live CUDA
+    tensors by shape once allocated memory has grown 2 GiB past the first call's."""
+    import collections
+    import gc
+    import logging
+
+    if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+        return
+    log = logging.getLogger(__name__)
+    allocated = torch.cuda.memory_allocated()
+    first = getattr(model, "_vllm_aligned_first_allocated", None)
+    if first is None:
+        model._vllm_aligned_first_allocated = first = allocated
+    log.warning("vllm_aligned memory: tokens=%d allocated=%.2f GiB peak=%.2f GiB growth=%.2f GiB", tokens,
+                allocated / 2**30, torch.cuda.max_memory_allocated() / 2**30, (allocated - first) / 2**30)  # fmt: skip
+    torch.cuda.reset_peak_memory_stats()
+    if allocated - first < 2 * 2**30:
+        return
+    sizes: collections.Counter = collections.Counter()
+    counts: collections.Counter = collections.Counter()
+    for obj in gc.get_objects():
+        if isinstance(obj, torch.Tensor) and obj.is_cuda and not isinstance(obj, torch.nn.Parameter):
+            key = (tuple(obj.shape), str(obj.dtype), obj.requires_grad)
+            sizes[key] += obj.untyped_storage().nbytes()
+            counts[key] += 1
+    for key, nbytes in sizes.most_common(12):
+        log.warning("vllm_aligned live tensors: %s x%d = %.2f GiB", key, counts[key], nbytes / 2**30)
+
+
 def aligned_logprobs(model: Any, input_ids: torch.Tensor, position_ids: torch.Tensor, labels: torch.Tensor,
                      trained: torch.Tensor, cu_seqlens: torch.Tensor | None, temperature: float,
                      kwargs: dict) -> torch.Tensor:  # fmt: skip
@@ -1234,6 +1264,7 @@ def aligned_logprobs(model: Any, input_ids: torch.Tensor, position_ids: torch.Te
                                 tp=getattr(model, "_vllm_aligned_tensor_parallel", 1))  # fmt: skip
     mode = getattr(model, "_vllm_aligned_backward", "stock")
     if mode == "vllm_op":
+        _log_memory(model, input_ids.numel())
         ctx.keep_moe_out = ctx.replay is not None
         run_backward = _per_op_backward_runner(ctx)
     elif mode == "vllm" and ctx.replay is not None:
