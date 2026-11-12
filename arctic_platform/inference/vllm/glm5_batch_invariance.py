@@ -407,56 +407,6 @@ def _fixed_fp8_block_moe_config() -> None:
     fused_moe.get_default_config = get_default_config
 
 
-# vLLM's batch-invariant kernels take one default config where vLLM has no tuned entry, as for GLM's shapes. The
-# configs below keep the default's BLOCK_SIZE_K (and, for FP8, BLOCK_SIZE_M), so they give bitwise the same output
-# at every batch size; on GLM-5.3-Flash's shapes they are faster (bf16: up to 1.8x for wide outputs; FP8: up to 1.4x).
-FP8_LINEAR_CONFIG = {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 32, "num_warps": 4,
-                     "num_stages": 4}  # fmt: skip
-
-
-def _bf16_matmul_config(M: int, N: int, default: dict) -> dict:
-    if N >= 8192:
-        return {**default, "BLOCK_SIZE_M": 64 if M <= 64 else 128, "BLOCK_SIZE_N": 256, "num_warps": 8, "num_stages": 4}
-    if N <= 256:
-        return {**default, "BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64, "num_warps": 4, "num_stages": 4}
-    return default
-
-
-def _fast_kernel_configs() -> None:
-    """Faster same-bits configs for vLLM's batch-invariant bf16 matmul and its Triton block-FP8 linear."""
-    import triton
-    from vllm.model_executor.determinism import batch_invariant
-    from vllm.model_executor.layers.quantization.utils import fp8_utils
-
-    original_matmul_config = batch_invariant._get_matmul_config
-
-    def get_matmul_config(M, N, K, dtype, default):
-        config = original_matmul_config(M, N, K, dtype, default)
-        if dtype != torch.bfloat16 or config != default:
-            return config
-        return _bf16_matmul_config(M, N, default)
-
-    batch_invariant._get_matmul_config = get_matmul_config
-    original_fp8 = fp8_utils.w8a8_triton_block_scaled_mm
-
-    def w8a8_triton_block_scaled_mm(A, B, As, Bs, block_size, output_dtype=torch.float16):
-        if (list(block_size) != [128, 128] or not A.is_cuda or not A.is_contiguous()
-                or torch.float8_e8m0fnu in (As.dtype, Bs.dtype)):  # fmt: skip
-            return original_fp8(A, B, As, Bs, block_size, output_dtype)
-        N, K = B.shape
-        M = A.numel() // A.shape[-1]
-        C = A.new_empty(A.shape[:-1] + (N,), dtype=output_dtype)
-        config = FP8_LINEAR_CONFIG
-        grid = (triton.cdiv(M, config["BLOCK_SIZE_M"]) * triton.cdiv(N, config["BLOCK_SIZE_N"]),)
-        fp8_utils._w8a8_triton_block_scaled_mm[grid](
-            A, B, C, As, Bs, M, N, K, 128, 128, A.stride(-2), A.stride(-1), B.stride(1), B.stride(0), C.stride(-2),
-            C.stride(-1), As.stride(-2), As.stride(-1), Bs.stride(1), Bs.stride(0), **config,
-        )  # fmt: skip
-        return C
-
-    fp8_utils.w8a8_triton_block_scaled_mm = w8a8_triton_block_scaled_mm
-
-
 def _sparse_mla_always_mqa() -> None:
     """Run every sparse MLA token through the absorbed ``forward_mqa`` path.
 
@@ -479,7 +429,7 @@ PROXY_ENV_VAR = "ARCTIC_GLM5_PROXY_LAYERS"
 SKIP_ENV_VAR = "ARCTIC_GLM5_BI_SKIP"
 PATCHES = ("gdn", "one_split", "mhc_split", "mhc_unfused", "router_gate", "mla_mqa", "fp8_linear", "kda_mixed",
            "indexer_topk", "causal_rows", "indexer_knorm", "indexer_weights", "grouped_topk", "kda_pin",
-           "moe_config", "kernel_configs")  # fmt: skip
+           "moe_config")  # fmt: skip
 
 
 def _load_proxy_layers_only(num_layers: int) -> None:
@@ -545,7 +495,7 @@ def ensure_glm5_batch_invariance() -> None:
                         ("indexer_topk", _deterministic_indexer_topk), ("causal_rows", _causal_indices_per_token),
                         ("indexer_knorm", _eager_indexer_k_norm),
                         ("indexer_weights", _batch_invariant_indexer_head_weights),
-                        ("moe_config", _fixed_fp8_block_moe_config), ("kernel_configs", _fast_kernel_configs)):  # fmt: skip
+                        ("moe_config", _fixed_fp8_block_moe_config)):  # fmt: skip
         if name not in skip:
             apply()
     if "grouped_topk" not in skip:
