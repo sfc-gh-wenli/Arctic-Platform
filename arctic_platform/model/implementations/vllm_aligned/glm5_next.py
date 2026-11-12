@@ -142,8 +142,7 @@ def _mhc_constants():
 
 
 def hc_pre(streams: torch.Tensor, hc: Any, norm: Any, config: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """vLLM's ``mhc_pre`` (TileLang, the batch-invariance patch's fixed split) with the sublayer's RMSNorm fused:
-    ``(post, comb, layer_input)``.
+    """vLLM's ``mhc_pre`` (TileLang, one split) with the sublayer's RMSNorm fused: ``(post, comb, layer_input)``.
 
     ``streams`` is ``[tokens, hc_mult, hidden]`` bf16; ``hc`` the stock ``Glm5NextTextHyperConnection`` and ``norm``
     the RMSNorm that follows it in the stock layer.

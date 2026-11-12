@@ -420,10 +420,6 @@ def _sparse_mla_always_mqa() -> None:
     MLAAttention._use_sparse_mha = lambda self, attn_metadata: False
 
 
-# Any fixed split of the pre-norm GEMM is batch-invariant (its partial sums are combined in a fixed order); one split
-# runs the 16384-long reduction on a single block per row tile, 17x slower than vLLM's choice in decode steps. 16 is
-# one of the counts vLLM's kernel warm-up compiles.
-MHC_PRE_SPLITS = 16
 PROXY_ENV_VAR = "ARCTIC_GLM5_PROXY_LAYERS"
 # Debug, for ablations: comma-separated patches of ``PATCHES`` to leave out. The backend gating always applies.
 SKIP_ENV_VAR = "ARCTIC_GLM5_BI_SKIP"
@@ -482,8 +478,8 @@ def ensure_glm5_batch_invariance() -> None:
         # The hyper-connection pre-norm GEMM splits its reduction by the step's token count; callers import these
         # from both modules at call time.
         for module in (tilelang_kernels, warmup):
-            module.compute_num_split = lambda *args, **kwargs: MHC_PRE_SPLITS
-            module.compute_mhc_pre_num_splits = lambda *args, **kwargs: MHC_PRE_SPLITS
+            module.compute_num_split = lambda *args, **kwargs: 1
+            module.compute_mhc_pre_num_splits = lambda *args, **kwargs: 1
     if "mhc_unfused" not in skip:
         # Small steps would take a fused post + pre-norm kernel with its own split; every step takes the split-free
         # path. The fused kernel then has no compile keys, so the kernel warm-up (run with CUDA graphs) must not ask
