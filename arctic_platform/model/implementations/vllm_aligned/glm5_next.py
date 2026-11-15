@@ -116,6 +116,15 @@ def tp_sum(partials: list[torch.Tensor]) -> torch.Tensor:
     return total.to(partials[0].dtype)
 
 
+def _shard(weight: torch.Tensor, scale: torch.Tensor | None, tp: int, rank: int,
+           dim: int) -> tuple[torch.Tensor, torch.Tensor | None]:  # fmt: skip
+    """A rank's shard of a weight along ``dim``: of a bf16 weight (``scale`` None), or of a block-FP8 one with its
+    block scales (:func:`_fp8_shard`)."""
+    if scale is None:
+        return tp_shard(weight, tp, rank, dim).contiguous(), None
+    return _fp8_shard(weight, scale, tp, rank, dim)
+
+
 def _fp8_shard(weight: torch.Tensor, scale: torch.Tensor, tp: int, rank: int, dim: int) -> tuple[torch.Tensor, torch.Tensor]:
     """A rank's shard of a block-FP8 weight and its block scales along ``dim`` (whole 128-blocks per rank)."""
     if tp == 1:
@@ -851,33 +860,40 @@ def _merged_fp8(*linears: Any) -> tuple[torch.Tensor, torch.Tensor]:
     return torch.cat([linear.weight for linear in linears]), torch.cat([linear.weight_scale_inv for linear in linears])
 
 
-def _fp8_mlp_partials(x: torch.Tensor, gate: tuple, up: tuple, down: tuple, swiglu_limit: float,
-                      tp: int) -> list[torch.Tensor]:  # fmt: skip
-    """vLLM's ``Glm5NextMLP`` on each tensor-parallel rank, before the all-reduce: its rows of the merged FP8
-    ``gate_up``, the clamped SwiGLU, its input columns of the FP8 ``down``. ``gate``/``up``/``down`` are
-    ``(weight, scale)``."""
+def _mlp_partials(x: torch.Tensor, gate: tuple, up: tuple, down: tuple, swiglu_limit: float,
+                  tp: int) -> list[torch.Tensor]:  # fmt: skip
+    """vLLM's ``Glm5NextMLP`` on each tensor-parallel rank, before the all-reduce: its rows of the merged ``gate_up``,
+    the clamped SwiGLU, its input columns of ``down``. ``gate``/``up``/``down`` are ``(weight, scale)``: block FP8
+    (``TritonFp8BlockScaledMMKernel``), or bf16 with ``scale`` None (the batch-invariant linear on the merged
+    weight, whose tile depends on its ``(N, K)``)."""
     partials = []
     for rank in range(tp):
-        (gate_w, gate_s), (up_w, up_s) = (_fp8_shard(*pair, tp, rank, 0) for pair in (gate, up))
+        (gate_w, gate_s), (up_w, up_s) = (_shard(*pair, tp, rank, 0) for pair in (gate, up))
+        down_w, down_s = _shard(*down, tp, rank, 1)
+        if gate_s is None:
+            gate_up = _linear(x, torch.cat([gate_w, up_w]))
+            hidden = _op(silu_and_mul_with_clamp, "ref_silu_and_mul_with_clamp", gate_up, limit=swiglu_limit)
+            partials.append(_linear(hidden, down_w))
+            continue
         if gate_w.shape[0] % FP8_BLOCK:
             raise ValueError(f"merging FP8 projections needs {FP8_BLOCK}-row pieces, got {gate_w.shape[0]}")
         gate_up = _op(fp8_block_linear, "ref_fp8_linear", x, torch.cat([gate_w, up_w]), torch.cat([gate_s, up_s]))
         hidden = _op(silu_and_mul_with_clamp, "ref_silu_and_mul_with_clamp", gate_up, limit=swiglu_limit)
-        partials.append(_op(fp8_block_linear, "ref_fp8_linear", hidden, *_fp8_shard(*down, tp, rank, 1)))
+        partials.append(_op(fp8_block_linear, "ref_fp8_linear", hidden, down_w, down_s))
     return partials
 
 
 def dense_mlp(mlp: Any, x: torch.Tensor, tp: int = 1) -> torch.Tensor:
-    """vLLM's ``Glm5NextMLP``: merged FP8 ``gate_up``, the clamped SwiGLU, FP8 ``down`` (all-reduced at ``tp`` > 1)."""
-    pieces = [(p.weight, p.weight_scale_inv) for p in (mlp.gate_proj, mlp.up_proj, mlp.down_proj)]
-    return tp_sum(_fp8_mlp_partials(x, *pieces, mlp.swiglu_limit, tp))
+    """vLLM's ``Glm5NextMLP``: merged ``gate_up``, the clamped SwiGLU, ``down`` (all-reduced at ``tp`` > 1)."""
+    pieces = [(p.weight, getattr(p, "weight_scale_inv", None)) for p in (mlp.gate_proj, mlp.up_proj, mlp.down_proj)]
+    return tp_sum(_mlp_partials(x, *pieces, mlp.swiglu_limit, tp))
 
 
 def shared_expert_partials(ffn: Any, x: torch.Tensor, swiglu_limit: float, tp: int = 1) -> list[torch.Tensor]:
     """vLLM's shared-expert ``Glm5NextMLP`` (``reduce_results=False``) on the trainer's ``BCFeedForward`` (``w1`` gate,
     ``w3`` up, ``w2`` down): each tensor-parallel rank's partial."""
-    pieces = [(ffn.w1, ffn.w1_scale_inv), (ffn.w3, ffn.w3_scale_inv), (ffn.w2, ffn.w2_scale_inv)]
-    return _fp8_mlp_partials(x, *pieces, swiglu_limit, tp)
+    pieces = [(getattr(ffn, w), getattr(ffn, f"{w}_scale_inv", None)) for w in ("w1", "w3", "w2")]
+    return _mlp_partials(x, *pieces, swiglu_limit, tp)
 
 
 def shared_expert_mlp(ffn: Any, x: torch.Tensor, swiglu_limit: float) -> torch.Tensor:
@@ -909,10 +925,12 @@ def _full(tensor: torch.Tensor, num_experts: int, ep_group: Any = None) -> torch
 
 def _triton_experts(num_experts: int, top_k: int, hidden: int, intermediate: int, swiglu_limit: float, w13_scale,
                     w2_scale, device):  # fmt: skip
-    """vLLM's routed-expert kernel for block-FP8 GLM-5.3-Flash at TP 1: ``FusedMoEKernel`` with ``TritonExperts``."""
+    """vLLM's routed-expert kernel for GLM-5.3-Flash at TP 1: ``FusedMoEKernel`` with ``TritonExperts``, block FP8, or
+    bf16 when ``w13_scale`` is None (``UnquantizedFusedMoEMethod``'s quant config: the SwiGLU clamp only)."""
     from vllm.model_executor.layers.fused_moe.activation import MoEActivation
     from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
     from vllm.model_executor.layers.fused_moe.config import FusedMoEParallelConfig
+    from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
     from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
     from vllm.model_executor.layers.fused_moe.experts.triton_moe import TritonExperts
     from vllm.model_executor.layers.fused_moe.modular_kernel import FusedMoEKernel
@@ -934,7 +952,7 @@ def _triton_experts(num_experts: int, top_k: int, hidden: int, intermediate: int
         routing_method=RoutingMethodType.DeepSeekV3,
         swiglu_limit=swiglu_limit,
     )
-    quant_config = make_fp8_moe_quant_config(
+    quant_config = FusedMoEQuantConfig.make(gemm1_clamp_limit=swiglu_limit) if w13_scale is None else make_fp8_moe_quant_config(
         fp8_backend=Fp8MoeBackend.TRITON,
         w1_scale=w13_scale,
         w2_scale=w2_scale,
@@ -1042,12 +1060,14 @@ def _routed_experts_ranks(x, weights, ids, *, experts: Any, total: int, ep_group
     """Each tensor-parallel rank's routed-expert output: vLLM's Triton experts on that rank's shard of every expert's
     ``gate``/``up`` rows and ``down`` columns, the experts gathered from every expert-parallel rank."""
     w1, w2, w3 = (_full(t, total, ep_group) for t in (experts.w1, experts.w2, experts.w3))
-    s1, s2, s3 = (_full(t, total, ep_group) for t in (experts.w1_scale_inv, experts.w2_scale_inv, experts.w3_scale_inv))
+    scales = [getattr(experts, f"{w}_scale_inv", None) for w in ("w1", "w2", "w3")]
+    s1, s2, s3 = (None, None, None) if scales[0] is None else (_full(t, total, ep_group) for t in scales)
     out = []
     for rank in range(tp):
-        (w1_r, s1_r), (w3_r, s3_r) = _fp8_shard(w1, s1, tp, rank, 1), _fp8_shard(w3, s3, tp, rank, 1)
-        w2_r, s2_r = _fp8_shard(w2, s2, tp, rank, 2)
-        w13, w13_scale = torch.cat([w1_r, w3_r], dim=1), torch.cat([s1_r, s3_r], dim=1)
+        (w1_r, s1_r), (w3_r, s3_r) = _shard(w1, s1, tp, rank, 1), _shard(w3, s3, tp, rank, 1)
+        w2_r, s2_r = _shard(w2, s2, tp, rank, 2)
+        w13 = torch.cat([w1_r, w3_r], dim=1)
+        w13_scale = None if s1_r is None else torch.cat([s1_r, s3_r], dim=1)
         out.append(_routed_experts_kernel(x, weights, ids, w13, w13_scale, w2_r, s2_r, top_k=top_k, limit=limit))
     return tuple(out)
 
@@ -1629,8 +1649,9 @@ def _causal_lm_forward(self, input_ids=None, attention_mask=None, position_ids=N
     return {"logprobs": logprobs.view(input_ids.shape)}
 
 
-def check_tensor_parallel(config: Any, tp: int) -> None:
-    """The sampler's tensor-parallel size has to split the heads, and the FP8 MLPs and experts in whole blocks."""
+def check_tensor_parallel(config: Any, tp: int, fp8: bool = True) -> None:
+    """The sampler's tensor-parallel size has to split the heads, and the MLPs and experts (block-FP8 ones in whole
+    blocks)."""
     if tp < 1:
         raise ValueError("tensor_parallel must be positive")
     if tp == 1:
@@ -1640,9 +1661,10 @@ def check_tensor_parallel(config: Any, tp: int) -> None:
             raise ValueError(f"config.{name}={getattr(config, name)} does not split across {tp} ranks")
     sizes = {"intermediate_size": config.intermediate_size, "moe_intermediate_size": config.moe_intermediate_size,
              "shared expert": config.moe_intermediate_size * (config.n_shared_experts or 1)}  # fmt: skip
+    block = FP8_BLOCK if fp8 else 1
     for name, size in sizes.items():
-        if size % (tp * FP8_BLOCK):
-            raise ValueError(f"{name} {size} does not split across {tp} ranks in {FP8_BLOCK}-blocks")
+        if size % (tp * block):
+            raise ValueError(f"{name} {size} does not split across {tp} ranks" + (f" in {block}-blocks" if fp8 else ""))
 
 
 def apply_vllm_aligned_glm5_next(model: Any, *, token_chunk_size: int, lm_head_fp32: bool = False,
@@ -1671,7 +1693,8 @@ def apply_vllm_aligned_glm5_next(model: Any, *, token_chunk_size: int, lm_head_f
 
     config = model.model.language_model.config
     check_supported_config(config)
-    check_tensor_parallel(config, int(tensor_parallel))
+    fp8 = any(hasattr(m, "weight_scale_inv") or hasattr(m, "w1_scale_inv") for m in model.modules())
+    check_tensor_parallel(config, int(tensor_parallel), fp8=fp8)
     ops.require_batch_invariant_env()
     import os
 

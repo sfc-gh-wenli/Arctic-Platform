@@ -668,3 +668,71 @@ def test_moe_replays_captured_experts_and_routes_the_rest(monkeypatch):
     assert torch.equal(seen["ids"][1:], own_ids[1:]) and torch.equal(seen["weights"][1:], own_weights[1:])
     logits = x.float() @ gate.float().t()
     assert torch.equal(seen["weights"][0], glm5_next.replayed_weights(logits[:1], seen["ids"][:1], config)[0])
+
+
+def test_bf16_mlp_partials_merge_gate_up_per_rank_and_sum_to_the_unsharded_mlp(monkeypatch):
+    import types
+
+    from arctic_platform.model.implementations.vllm_aligned import glm5_next
+    from arctic_platform.model.implementations.vllm_aligned.glm5_next_backward import ref_silu_and_mul_with_clamp
+
+    seen = []
+
+    def linear(x, w):
+        seen.append(tuple(w.shape))
+        return x.double() @ w.double().t()
+
+    monkeypatch.setattr(glm5_next, "_linear", linear)
+    monkeypatch.setattr(glm5_next, "silu_and_mul_with_clamp", ref_silu_and_mul_with_clamp)
+    gen = torch.Generator().manual_seed(2)
+    hidden, inter, limit = 16, 8, 7.0
+    gate, up, down = (torch.randn(*shape, generator=gen) for shape in ((inter, hidden), (inter, hidden), (hidden, inter)))
+    mlp = types.SimpleNamespace(gate_proj=types.SimpleNamespace(weight=gate), up_proj=types.SimpleNamespace(weight=up),
+                                down_proj=types.SimpleNamespace(weight=down), swiglu_limit=limit)  # fmt: skip
+    x = torch.randn(5, hidden, generator=gen)
+    whole = glm5_next.dense_mlp(mlp, x, tp=1)
+    assert seen == [(2 * inter, hidden), (hidden, inter)]
+    seen.clear()
+    split = glm5_next.dense_mlp(mlp, x, tp=2)
+    assert seen == [(inter, hidden), (hidden, inter // 2)] * 2
+    assert torch.allclose(split.double(), whole.double(), atol=1e-6)
+
+
+def test_bf16_routed_experts_hand_each_rank_its_shards_without_scales(monkeypatch):
+    import types
+
+    from arctic_platform.model.implementations.vllm_aligned import glm5_next
+
+    calls = []
+
+    def kernel(x, weights, ids, w13, w13_scale, w2, w2_scale, *, top_k, limit):
+        calls.append((w13, w13_scale, w2, w2_scale))
+        return torch.zeros_like(x)
+
+    monkeypatch.setattr(glm5_next, "_routed_experts_kernel", kernel)
+    experts_n, hidden, inter = 4, 16, 8
+    experts = types.SimpleNamespace(w1=torch.randn(experts_n, inter, hidden), w3=torch.randn(experts_n, inter, hidden),
+                                    w2=torch.randn(experts_n, hidden, inter))  # fmt: skip
+    x, weights, ids = torch.randn(3, hidden), torch.rand(3, 2), torch.tensor([[0, 1], [2, 3], [1, 2]])
+    glm5_next._routed_experts_ranks(x, weights, ids, experts=experts, total=experts_n, ep_group=None, tp=2, top_k=2,
+                                    limit=7.0)  # fmt: skip
+    assert len(calls) == 2
+    for rank, (w13, s13, w2, s2) in enumerate(calls):
+        half = slice(rank * inter // 2, (rank + 1) * inter // 2)
+        assert s13 is None and s2 is None
+        assert torch.equal(w13, torch.cat([experts.w1[:, half], experts.w3[:, half]], dim=1))
+        assert torch.equal(w2, experts.w2[:, :, half])
+
+
+def test_tensor_parallel_check_drops_the_fp8_block_rule_for_bf16_checkpoints():
+    import types
+
+    import pytest
+
+    from arctic_platform.model.implementations.vllm_aligned.glm5_next import check_tensor_parallel
+
+    config = types.SimpleNamespace(num_attention_heads=64, linear_num_heads=64, intermediate_size=12288 + 64,
+                                   moe_intermediate_size=2048, n_shared_experts=1)  # fmt: skip
+    check_tensor_parallel(config, 8, fp8=False)
+    with pytest.raises(ValueError):
+        check_tensor_parallel(config, 8, fp8=True)
