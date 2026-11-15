@@ -35,6 +35,14 @@ from arctic_platform.inference.utils import require_supported_vllm_version
 logger = logging.getLogger(__name__)
 
 
+def _as_view_shape(tensor: torch.Tensor, view: torch.Tensor) -> torch.Tensor:
+    """``tensor`` in ``view``'s shape when the two differ only by size-1 dimensions (a checkpoint's 1-D ``A_log``
+    against GLM-5.3-Flash's ``[1, 1, heads, 1]`` parameter, which vLLM's weight loader reshapes the same way)."""
+    if tensor.shape != view.shape and [d for d in tensor.shape if d != 1] == [d for d in view.shape if d != 1]:
+        return tensor.reshape(view.shape)
+    return tensor
+
+
 def _weight_sync_names_are_strict() -> bool:
     return os.environ.get("ARCTIC_WEIGHT_SYNC_STRICT_NAMES", "1") != "0"
 
@@ -370,6 +378,15 @@ def _refresh_cached_weight_copies(model) -> int:
             if head_gate is not None:
                 head_gate.copy_(module.wk_weights_proj.weight[module.head_dim :].t())
                 refreshed += 1
+            w_uk_t, w_uv = getattr(module, "W_UK_T", None), getattr(module, "W_UV", None)
+            if w_uk_t is not None and w_uv is not None and getattr(module, "kv_b_proj", None) is not None:
+                from vllm.model_executor.layers.attention.mla_attention import split_kv_b_proj
+
+                w_uk, w_uv_new = split_kv_b_proj(module.kv_b_proj, w_uk_t.dtype, module.kv_lora_rank,
+                                                 module.num_heads, module.qk_nope_head_dim, module.v_head_dim)  # fmt: skip
+                w_uv.copy_(w_uv_new.transpose(0, 1))
+                w_uk_t.copy_(w_uk.permute(1, 2, 0))
+                refreshed += 1
     return refreshed
 
 
@@ -640,7 +657,7 @@ class WeightSyncExtension:
             view = writer.get_view(name)
             destination = writer.get_destination(name)
             if view is not None and destination is not None:
-                view.copy_(tensor)
+                view.copy_(_as_view_shape(tensor, view))
                 source_to_destinations[name] = [destination]
             else:
                 orphans.append(name)

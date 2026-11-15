@@ -1197,3 +1197,15 @@ def test_load_batched_holds_one_rebuilt_oversized_tensor_at_a_time(monkeypatch):
 
     assert loaded == 4
     assert peaks == [8, 6, 6]
+
+
+def test_direct_load_reshapes_a_tensor_that_differs_only_by_size_one_dims():
+    import torch
+
+    from arctic_platform.inference.server.weight_sync.receiver import _as_view_shape
+
+    view = torch.empty(1, 1, 4, 1)
+    a_log = torch.arange(4.0)
+    assert torch.equal(_as_view_shape(a_log, view), a_log.view(1, 1, 4, 1))
+    other = torch.arange(8.0).reshape(2, 4)
+    assert _as_view_shape(other, torch.empty(4, 2)) is other  # a different layout is left to fail loudly
