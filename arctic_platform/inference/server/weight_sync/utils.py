@@ -514,12 +514,17 @@ class _DirectParamWriter:
             else:
                 continue
 
+            bias = getattr(mod, "bias", None)
             for orig_name, shard_idx in originals:
                 sf_key = f"{prefix}.{orig_name}.weight" if prefix else f"{orig_name}.weight"
                 offset = sum(output_sizes[:shard_idx]) // tp_size
                 size = output_sizes[shard_idx] // tp_size
                 self._views[sf_key] = weight.data.narrow(output_dim, offset, size)
                 self._destinations[sf_key] = f"{mod_path}.weight"
+                if bias is not None:  # e.g. a vision tower's merged gate_up_proj
+                    bias_key = f"{prefix}.{orig_name}.bias" if prefix else f"{orig_name}.bias"
+                    self._views[bias_key] = bias.data.narrow(0, offset, size)
+                    self._destinations[bias_key] = f"{mod_path}.bias"
 
         for name, param in params.items():
             if name not in self._views:
