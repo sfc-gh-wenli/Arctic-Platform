@@ -601,3 +601,70 @@ def test_turn_layout_reads_cached_pages_from_their_writer_and_resumes_its_state(
         (False, [10, 11, 12], [0, 3], [2], [True], [(2, (0, 8))], []),
         (True, [13], [0, 1], [2], [True], [], []),
     ]
+
+
+def _router_config():
+    import types
+
+    return types.SimpleNamespace(scoring_func="sigmoid", norm_topk_prob=True, routed_scaling_factor=2.5,
+                                 n_routed_experts=16, n_group=4, topk_group=2, num_experts_per_tok=4, swiglu_limit=7.0)  # fmt: skip
+
+
+def test_replayed_weights_equal_the_grouped_topk_at_its_own_experts():
+    from arctic_platform.inference.vllm.glm5_batch_invariance import grouped_topk
+    from arctic_platform.model.implementations.vllm_aligned.glm5_next import replayed_weights
+
+    config, gen = _router_config(), torch.Generator().manual_seed(0)
+    logits = torch.randn(64, config.n_routed_experts, generator=gen)
+    bias = torch.randn(config.n_routed_experts, generator=gen) * 0.1
+    weights, ids = grouped_topk(None, logits, topk=config.num_experts_per_tok, renormalize=True,
+                                num_expert_group=config.n_group, topk_group=config.topk_group, scoring_func="sigmoid",
+                                routed_scaling_factor=config.routed_scaling_factor, e_score_correction_bias=bias)  # fmt: skip
+    assert torch.equal(replayed_weights(logits, ids, config), weights)
+
+
+def test_replay_mask_takes_distinct_in_range_routes_only():
+    from arctic_platform.model import ROUTER_REPLAY_FRESH
+    from arctic_platform.model.implementations.vllm_aligned.glm5_next import replay_mask
+
+    routes = torch.tensor([[3, 1, 7, 12], [0, 0, 0, 0], [ROUTER_REPLAY_FRESH] * 4, [3, 3, 7, 12], [3, 1, 7, 16]])
+    assert replay_mask(routes, 16).tolist() == [True, False, False, False, False]
+
+
+def test_moe_replays_captured_experts_and_routes_the_rest(monkeypatch):
+    import types
+
+    from arctic_platform.model.implementations.vllm_aligned import glm5_next
+
+    config, gen = _router_config(), torch.Generator().manual_seed(1)
+    x = torch.randn(3, 8, generator=gen)
+    gate = torch.randn(config.n_routed_experts, 8, generator=gen)
+    mlp = types.SimpleNamespace(router=types.SimpleNamespace(gate=types.SimpleNamespace(weight=gate)),
+                                expert_bias=torch.zeros(config.n_routed_experts), shared_expert=None, experts=None)  # fmt: skip
+    seen = {}
+
+    def routed(x, weights, ids, **_):
+        seen.update(weights=weights, ids=ids)
+        return torch.zeros_like(x)
+
+    monkeypatch.setattr(glm5_next, "_routed_experts_ranks", routed)
+    monkeypatch.setattr(glm5_next, "shared_expert_partials", lambda *a, **k: [torch.zeros_like(x)])
+    monkeypatch.setattr(glm5_next, "tp_sum", lambda parts: parts[0])
+    import sys
+
+    workspace = types.ModuleType("vllm.v1.worker.workspace")
+    workspace.is_workspace_manager_initialized, workspace.init_workspace_manager = (lambda: True), (lambda device: None)
+    for name in ("vllm", "vllm.v1", "vllm.v1.worker"):
+        monkeypatch.setitem(sys.modules, name, sys.modules.get(name) or types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, "vllm.v1.worker.workspace", workspace)
+    fp32_logits = types.ModuleType("arctic_platform.inference.vllm.batch_invariant_fp32_logits")
+    fp32_logits.linear_fp32_out = lambda x, w: x.float() @ w.float().t()
+    monkeypatch.setitem(sys.modules, fp32_logits.__name__, fp32_logits)
+    glm5_next.moe(mlp, x, config)
+    own_ids, own_weights = seen["ids"].clone(), seen["weights"].clone()
+    replay = torch.tensor([[15, 14, 13, 12], [0, 0, 0, 0], own_ids[2].tolist()])
+    glm5_next.moe(mlp, x, config, routes=replay)
+    assert seen["ids"][0].tolist() == [15, 14, 13, 12]
+    assert torch.equal(seen["ids"][1:], own_ids[1:]) and torch.equal(seen["weights"][1:], own_weights[1:])
+    logits = x.float() @ gate.float().t()
+    assert torch.equal(seen["weights"][0], glm5_next.replayed_weights(logits[:1], seen["ids"][:1], config)[0])

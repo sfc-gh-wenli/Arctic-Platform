@@ -952,11 +952,38 @@ def _triton_experts(num_experts: int, top_k: int, hidden: int, intermediate: int
     return FusedMoEKernel(prepare, TritonExperts(moe_config, quant_config)), MoEActivation.SILU
 
 
+def replay_mask(routes: torch.Tensor, n_experts: int) -> torch.Tensor:
+    """``[tokens]``: which rows of ``routes`` (``[tokens, top_k]``) hold a captured route: distinct expert ids in
+    range. DSS fills a position no capture covers with zeros and a best-effort fresh row with ``ROUTER_REPLAY_FRESH``;
+    neither is a valid top-k."""
+    ordered = routes.sort(dim=-1).values
+    distinct = (ordered[:, 1:] != ordered[:, :-1]).all(-1) if routes.shape[-1] > 1 else torch.ones_like(routes[:, 0], dtype=torch.bool)
+    return distinct & (routes >= 0).all(-1) & (routes < n_experts).all(-1)
+
+
+def replayed_weights(logits: torch.Tensor, ids: torch.Tensor, config: Any) -> torch.Tensor:
+    """The gate weights of the experts ``ids`` (``[tokens, top_k]``), in :func:`grouped_topk`'s arithmetic: the
+    unbiased scores of those experts, renormalized by the ordered sum, then scaled. Equal to its weights, bit for bit,
+    when ``ids`` are the experts it selects, in its order."""
+    from arctic_platform.inference.vllm.glm5_batch_invariance import _ordered_sum
+
+    scores = logits.sigmoid() if config.scoring_func == "sigmoid" else torch.softmax(logits, dim=-1)
+    weights = scores.gather(1, ids.long())
+    if config.norm_topk_prob:
+        weights = weights / _ordered_sum(weights)
+    if config.routed_scaling_factor != 1.0:
+        weights = weights * config.routed_scaling_factor
+    return weights.to(torch.float32)
+
+
 def moe(mlp: Any, x: torch.Tensor, config: Any, ep_group: Any = None, record: dict | None = None,
-        tp: int = 1, keep_out: bool = False) -> torch.Tensor:  # fmt: skip
+        tp: int = 1, keep_out: bool = False, routes: torch.Tensor | None = None) -> torch.Tensor:  # fmt: skip
     """vLLM's ``Glm5NextMoE`` on the trainer's ``MoE``: fp32 router logits by the batch-invariant matmul, the
     batch-invariant grouped top-k (renormalized and scaled by ``routed_scaling_factor`` there, as vLLM's router does
     when the runner does not scale the output), the Triton routed experts, then ``shared + routed`` in bf16.
+
+    ``routes`` (``[tokens, top_k]``, router replay): each token with a captured route takes those experts, with
+    their gate weights from this forward's logits (:func:`replayed_weights`); the others route themselves.
 
     At ``tp`` > 1 (experts on every rank, split by intermediate size) each tensor-parallel rank runs the experts on its
     shard of every expert's ``gate``/``up`` rows and ``down`` columns, adds its shared-expert partial, and the ranks'
@@ -979,10 +1006,18 @@ def moe(mlp: Any, x: torch.Tensor, config: Any, ep_group: Any = None, record: di
 
     with torch.no_grad():
         weights, ids = route(logits)
+        if routes is not None:
+            captured = replay_mask(routes, config.n_routed_experts)
+            ids = torch.where(captured[:, None], routes.to(ids.dtype), ids)
+            weights = torch.where(captured[:, None], replayed_weights(logits, ids, config), weights)
     if _DIFFERENTIABLE.get():
         if config.scoring_func != "sigmoid":
             raise NotImplementedError("the per-op vLLM backward covers sigmoid routing")
-        weights = _op(lambda logits, ids, **_: route(logits)[0], "ref_router_weights", logits, ids,
+
+        def weights_of(logits, ids, **_):
+            return route(logits)[0] if routes is None else replayed_weights(logits, ids, config)
+
+        weights = _op(weights_of, "ref_router_weights", logits, ids,
                       renormalize=config.norm_topk_prob, scaling=config.routed_scaling_factor)  # fmt: skip
     if record is not None:
         record["experts"] = ids.to(torch.int64)
@@ -1053,8 +1088,10 @@ def _mlp(layer: Any, x: torch.Tensor, ctx: Any) -> torch.Tensor:
     tp = getattr(ctx, "tp", 1)
     if hasattr(layer.mlp, "gate_proj"):
         return dense_mlp(layer.mlp, x, tp)
+    routes = getattr(ctx, "routes", None)
     return moe(layer.mlp, x, ctx.config, getattr(ctx, "ep_group", None), _record(ctx, layer), tp,
-               keep_out=getattr(ctx, "keep_moe_out", False))  # fmt: skip
+               keep_out=getattr(ctx, "keep_moe_out", False),
+               routes=None if routes is None else routes[:, layer._replay_layer_idx])  # fmt: skip
 
 
 def _record(ctx: Any, layer: Any) -> dict | None:
@@ -1128,8 +1165,8 @@ def _stock_replay(layer: Any, record: dict, kwargs: dict, vllm_mla_weights: bool
                 module.forward = _types.MethodType(_bf16_linear_forward, module)
                 swapped.append(module)
     extra = {}
-    experts = record.get("experts")
-    if experts is not None and kwargs.get("routed_experts") is None:
+    experts = record.get("experts")  # the aligned forward's, replayed routes included
+    if experts is not None:
         index = layer._replay_layer_idx
         routes = experts.new_zeros((1, experts.shape[0], index + 1, experts.shape[1]))
         routes[0, :, index] = experts
@@ -1508,6 +1545,9 @@ def aligned_logprobs(model: Any, input_ids: torch.Tensor, position_ids: torch.Te
         position_ids = position_ids[0]
     layout = ops.PackedLayout.build(position_ids, block_size=1, cu_seqlens=cu_seqlens)
     cu = layout.cu_seqlens.to(torch.int32)
+    routes = kwargs.get("routed_experts")  # router replay: [1, tokens (or more, padded), layers, top_k]
+    if routes is not None:
+        routes = routes.reshape(-1, *routes.shape[-2:])[: input_ids.numel()].to(input_ids.device)
     turns = None
     mode = getattr(model, "_vllm_aligned_backward", "stock")
     if plan is not None:
@@ -1520,10 +1560,12 @@ def aligned_logprobs(model: Any, input_ids: torch.Tensor, position_ids: torch.Te
         scored = torch.zeros(turns.expand_index.numel(), dtype=torch.bool, device=input_ids.device)
         scored[turns.output_index[turns.output_index >= 0]] = True
         input_ids = input_ids.reshape(-1)[turns.expand_index]
+        # one route per row position (the trajectory's last capture), so every span computing it replays it
+        routes = None if routes is None else routes[turns.expand_index]
         position_ids = turns.positions
         labels = torch.where(scored, labels.reshape(-1)[turns.expand_index], -100)
     ctx = types.SimpleNamespace(config=config, positions=layout.positions if turns is None else turns.positions,
-                                cu_seqlens=cu if turns is None else turns.cu, turns=turns,
+                                cu_seqlens=cu if turns is None else turns.cu, turns=turns, routes=routes,
                                 prompt_lens=None if turns is not None else prompt_lengths(trained, cu),
                                 replay={} if torch.is_grad_enabled() else None,
                                 ep_group=getattr(model, "_vllm_aligned_ep_group", None),
