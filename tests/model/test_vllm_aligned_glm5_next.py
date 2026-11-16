@@ -736,3 +736,37 @@ def test_tensor_parallel_check_drops_the_fp8_block_rule_for_bf16_checkpoints():
     check_tensor_parallel(config, 8, fp8=False)
     with pytest.raises(ValueError):
         check_tensor_parallel(config, 8, fp8=True)
+
+
+def test_packed_boundaries_from_gathered_positions_make_each_pad_token_its_own_request():
+    from arctic_platform.model.implementations.vllm_aligned.glm5_next import _cu_from_positions
+
+    positions = torch.tensor([[0, 1, 2, 0, 1, 0, 0]])
+    assert _cu_from_positions(positions).tolist() == [0, 3, 5, 6, 7]
+    assert _cu_from_positions(torch.tensor([[3, 4, 0]])).tolist() == [0, 2, 3]
+
+
+def test_sequence_parallel_mixer_runs_the_whole_sequence_and_keeps_the_shards_rows(monkeypatch):
+    import types
+
+    from arctic_platform.model.implementations.vllm_aligned import glm5_next
+
+    whole = torch.arange(8.0).reshape(8, 1)
+    shard = slice(4, 8)
+    seen = {}
+
+    def sparse_attention(attn, x, positions, cu_seqlens, config, record=None, tp=1, keys=None):
+        seen["tokens"] = x.shape[0]
+        if record is not None:
+            record["topk"] = torch.arange(8 * 2).reshape(8, 2)
+        return x * 10
+
+    monkeypatch.setattr(glm5_next, "_gather_tokens", lambda group, x, dim=0: whole)
+    monkeypatch.setattr(glm5_next, "mla_attention", sparse_attention)
+    layer = types.SimpleNamespace(block_type="deepseek_sparse_attention", self_attn=None)
+    ctx = types.SimpleNamespace(config=None, positions=None, cu_seqlens=None, turns=None, replay={}, sp_group=object(),
+                                shard=shard)  # fmt: skip
+    out = glm5_next._mixer(layer, whole[shard], ctx)
+    assert seen["tokens"] == 8
+    assert torch.equal(out, whole[shard] * 10)
+    assert torch.equal(ctx.replay[id(layer)]["topk"], torch.arange(16).reshape(8, 2)[shard])

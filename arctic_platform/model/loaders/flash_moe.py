@@ -227,6 +227,7 @@ def load_glm5_next(ctx: LoaderContext) -> LoadedModel:
             tensor_parallel=options.vllm_aligned_tensor_parallel,
             backward=options.vllm_aligned_backward,
             prefill_chunk=options.vllm_aligned_prefill_chunk,
+            sp_group=(ctx.parallel_groups or {}).get("sp_group") if ctx.spec.parallelism.sequence_parallel > 1 else None,
         )
     return loaded
 
