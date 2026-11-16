@@ -494,6 +494,40 @@ def _kpool_aligned_chunks() -> None:
     Scheduler._mamba_block_aligned_split = _mamba_block_aligned_split
 
 
+def _fixed_order_tp_all_reduce() -> None:
+    """Reduce every floating-point tensor-parallel all-reduce as vLLM's ``all_reduce_batch_invariant`` does (an
+    all-gather, then each element's rank contributions summed in ascending rank order in fp32, rounded once).
+
+    vLLM uses that reduction under ``VLLM_BATCH_INVARIANT`` only on ROCm. On CUDA it keeps its custom all-reduce, and
+    at TP 8 a decode step's ``o_proj`` sum then depends on how many tokens the step holds (GLM-5.3-Flash, layer
+    digests). The all-gather goes through pynccl, which CUDA graphs capture."""
+    import triton
+    from vllm.distributed.device_communicators.cuda_communicator import CudaCommunicator
+    from vllm.model_executor.determinism import batch_invariant
+
+    original = CudaCommunicator.all_reduce
+
+    def all_reduce(self, input_):
+        if self.world_size == 1 or not input_.is_floating_point():
+            return original(self, input_)
+        x = input_.contiguous()
+        numel = x.numel()
+        gathered = torch.empty((self.world_size, numel), dtype=x.dtype, device=x.device)
+        pynccl = self.pynccl_comm
+        if pynccl is not None and not pynccl.disabled:
+            pynccl.all_gather(gathered.view(-1), x.view(-1))
+        else:
+            torch.distributed.all_gather_into_tensor(gathered, x.view(-1), group=self.device_group)
+        out = torch.empty_like(x)
+        batch_invariant._fixed_order_sum_kernel[(triton.cdiv(numel, 1024),)](
+            gathered, out.view(-1), numel, numel, WORLD_SIZE=self.world_size, BLOCK_SIZE=1024,
+            LARGE=gathered.numel() > 2**31,
+        )  # fmt: skip
+        return out.view_as(input_)
+
+    CudaCommunicator.all_reduce = all_reduce
+
+
 def _sparse_mla_always_mqa() -> None:
     """Run every sparse MLA token through the absorbed ``forward_mqa`` path.
 
@@ -512,7 +546,7 @@ PROXY_ENV_VAR = "ARCTIC_GLM5_PROXY_LAYERS"
 SKIP_ENV_VAR = "ARCTIC_GLM5_BI_SKIP"
 PATCHES = ("gdn", "one_split", "mhc_split", "mhc_unfused", "router_gate", "mla_mqa", "fp8_linear", "kda_mixed",
            "indexer_topk", "causal_rows", "indexer_knorm", "indexer_weights", "grouped_topk", "kda_pin",
-           "moe_config", "kpool_chunks", "kda_checkpoints")  # fmt: skip
+           "moe_config", "kpool_chunks", "kda_checkpoints", "tp_allreduce")  # fmt: skip
 
 
 def _load_proxy_layers_only(num_layers: int) -> None:
@@ -579,7 +613,7 @@ def ensure_glm5_batch_invariance() -> None:
                         ("indexer_knorm", _eager_indexer_k_norm),
                         ("indexer_weights", _batch_invariant_indexer_head_weights),
                         ("moe_config", _fixed_fp8_block_moe_config), ("kpool_chunks", _kpool_aligned_chunks),
-                        ("kda_checkpoints", _no_kda_prefill_checkpoints)):  # fmt: skip
+                        ("kda_checkpoints", _no_kda_prefill_checkpoints), ("tp_allreduce", _fixed_order_tp_all_reduce)):  # fmt: skip
         if name not in skip:
             apply()
     if "grouped_topk" not in skip:
