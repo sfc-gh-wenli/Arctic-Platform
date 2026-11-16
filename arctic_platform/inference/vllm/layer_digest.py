@@ -260,6 +260,7 @@ def ensure_layer_digest() -> None:
                         "input_ids": None if input_ids is None else input_ids.detach().cpu(),
                         "positions": positions.detach().cpu(),
                         "digests": _state["digests"],
+                        "aux": _state.pop("aux", None),
                     },
                     os.path.join(directory, f"step{_state['step']:05d}.pt"),
                 )
@@ -341,6 +342,19 @@ def ensure_layer_digest() -> None:
         if state is not None and indices is not None and tokens:
             flat = indices.reshape(-1).long().clamp(min=0)[:tokens]
             record_numbered("kda.state_in", _all_ranks(state[flat].reshape(tokens, -1)))
+            if not args and kwargs.get("num_accepted_tokens") is None and indices.dim() == 1:
+                # The same call on a contiguous copy of the rows it reads (slot n + 1 for sequence n), so a
+                # difference from ``kda.recurrent_out`` means the kernel reads state other than ``state[indices]``.
+                scratch = torch.cat([torch.zeros_like(state[:1]), state[flat].clone()]).contiguous()
+                slots = torch.arange(1, tokens + 1, dtype=indices.dtype, device=indices.device)
+                isolated, _ = original_recurrent(**{**kwargs, "initial_state": scratch, "ssm_state_indices": slots,
+                                                    "out": None})  # fmt: skip
+                record_numbered("kda.recurrent_isolated", _all_ranks(isolated.reshape(tokens, -1)))
+                if _state["digests"] is not None:
+                    aux = _state.setdefault("aux", [])
+                    aux.append({"layer": _state.get("layer"), "indices": indices[:tokens].tolist(),
+                                "state_shape": list(state.shape), "state_stride": list(state.stride()),
+                                "contiguous_rows": bool(state[0].is_contiguous())})  # fmt: skip
         out = original_recurrent(*args, **kwargs)
         o = out[0] if isinstance(out, tuple) else out
         if tokens:
