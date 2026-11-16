@@ -746,6 +746,22 @@ def test_packed_boundaries_from_gathered_positions_make_each_pad_token_its_own_r
     assert _cu_from_positions(torch.tensor([[3, 4, 0]])).tolist() == [0, 2, 3]
 
 
+def test_uneven_shards_are_padded_for_the_gather_and_trimmed_after(monkeypatch):
+    from arctic_platform.model.implementations.vllm_aligned import glm5_next
+
+    sent = []
+
+    def gather(group, x, dim=0):
+        sent.append(x.clone())
+        return torch.cat([torch.full_like(x, 7.0), x])  # rank 0's full chunk, then this rank's padded rows
+
+    monkeypatch.setattr(glm5_next, "_gather_tokens", gather)
+    with torch.no_grad():
+        out = glm5_next._gather_rows(None, torch.ones(2, 3), chunk=4, total=6)
+    assert sent[0].shape == (4, 3) and torch.equal(sent[0][2:], torch.zeros(2, 3))
+    assert torch.equal(out, torch.cat([torch.full((4, 3), 7.0), torch.ones(2, 3)]))
+
+
 def test_sequence_parallel_mixer_runs_the_whole_sequence_and_keeps_the_shards_rows(monkeypatch):
     import types
 
@@ -761,11 +777,11 @@ def test_sequence_parallel_mixer_runs_the_whole_sequence_and_keeps_the_shards_ro
             record["topk"] = torch.arange(8 * 2).reshape(8, 2)
         return x * 10
 
-    monkeypatch.setattr(glm5_next, "_gather_tokens", lambda group, x, dim=0: whole)
+    monkeypatch.setattr(glm5_next, "_gather_rows", lambda group, x, chunk, total: whole)
     monkeypatch.setattr(glm5_next, "mla_attention", sparse_attention)
     layer = types.SimpleNamespace(block_type="deepseek_sparse_attention", self_attn=None)
     ctx = types.SimpleNamespace(config=None, positions=None, cu_seqlens=None, turns=None, replay={}, sp_group=object(),
-                                shard=shard)  # fmt: skip
+                                shard=shard, sp_chunk=4, sp_tokens=8)  # fmt: skip
     out = glm5_next._mixer(layer, whole[shard], ctx)
     assert seen["tokens"] == 8
     assert torch.equal(out, whole[shard] * 10)

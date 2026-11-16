@@ -824,6 +824,19 @@ def _gather_tokens(group: Any, x: torch.Tensor, dim: int = 0) -> torch.Tensor:
     return torch.cat(parts, dim=dim).to(dtype)
 
 
+def _gather_rows(group: Any, x: torch.Tensor, chunk: int, total: int) -> torch.Tensor:
+    """The ranks' rows of ``x`` (each at most ``chunk``, padded to it for the collective) concatenated in rank order,
+    ``total`` rows. With gradients on (the per-op backward) the gather is autograd-aware: its backward sums the ranks'
+    gradients and hands each rank its rows' (``gather_sequence``)."""
+    from arctic_platform.model.implementations.gpu.sp.collectives import gather_sequence
+
+    if x.shape[0] < chunk:
+        x = torch.nn.functional.pad(x, [0, 0] * (x.dim() - 1) + [0, chunk - x.shape[0]])
+    if torch.is_grad_enabled():
+        return gather_sequence(x.unsqueeze(0), group)[0][:total]
+    return _gather_tokens(group, x)[:total]
+
+
 def _cu_from_positions(positions: torch.Tensor) -> torch.Tensor:
     """Packed request boundaries from per-row positions (each request restarts at 0; a pad token is its own)."""
     pos = positions.reshape(-1)
@@ -837,12 +850,13 @@ def _sequence_parallel_mixer(layer: Any, x: torch.Tensor, ctx: Any) -> torch.Ten
     """The mixer of a sequence-parallel rank's token shard: the layer input gathered from every rank, the mixer on
     the whole packed sequence (the same call as without sequence parallelism, so the same bits), the shard's rows
     of its output. The sparse top-k rows the backward's stock recompute replays are the shard's queries' (global
-    key indices, as the stock context-parallel attention reads them)."""
+    key indices, as the stock context-parallel attention reads them). Differentiated (the per-op backward), each
+    rank backpropagates its rows of the output through the whole mixer and the gather sums the ranks' gradients."""
     import types
 
     record = _record(ctx, layer)
     whole = types.SimpleNamespace(**{**vars(ctx), "sp_group": None, "replay": None if record is None else {}})
-    out = _mixer(layer, _gather_tokens(ctx.sp_group, x), whole)
+    out = _mixer(layer, _gather_rows(ctx.sp_group, x, ctx.sp_chunk, ctx.sp_tokens), whole)
     if record is not None:
         rows = whole.replay.get(id(layer), {}).get("topk")
         if rows is not None:
@@ -1606,32 +1620,19 @@ def aligned_logprobs(model: Any, input_ids: torch.Tensor, position_ids: torch.Te
     if routes is not None:
         routes = routes.reshape(-1, *routes.shape[-2:]).to(input_ids.device)
     mode = getattr(model, "_vllm_aligned_backward", "stock")
-    group, shard = getattr(model, "_vllm_aligned_sp_group", None), None
+    group, local = getattr(model, "_vllm_aligned_sp_group", None), input_ids.numel()
     if group is not None:
         # Each rank holds a contiguous window of the packed call; concatenated in rank order they are the call.
-        if plan is not None:
-            raise NotImplementedError("the vLLM-aligned GLM-5.3-Flash forward replays turn plans at sp_size 1 only")
-        local, size = input_ids.numel(), torch.distributed.get_world_size(group)
-        shard = slice(torch.distributed.get_rank(group) * local, (torch.distributed.get_rank(group) + 1) * local)
-        if routes is not None and routes.shape[0] < local * size:
+        if routes is not None and routes.shape[0] < local * torch.distributed.get_world_size(group):
             routes = _gather_tokens(group, routes[:local])
         input_ids, position_ids, labels, trained = (_gather_tokens(group, t.reshape(1, -1), dim=1)
                                                     for t in (input_ids, position_ids, labels, trained))  # fmt: skip
+        plan = None if plan is None else _gather_tokens(group, plan.reshape(1, -1, *plan.shape[-2:]), dim=1)
         cu_seqlens = _cu_from_positions(position_ids)
     layout = ops.PackedLayout.build(position_ids, block_size=1, cu_seqlens=cu_seqlens)
     cu = layout.cu_seqlens.to(torch.int32)
     if routes is not None:
         routes = routes[: input_ids.numel()]
-    local_ids = input_ids if shard is None else input_ids.reshape(-1)[shard].reshape(1, -1)
-    local_positions = position_ids if shard is None else position_ids.reshape(-1)[shard].reshape(1, -1)
-    if shard is not None:
-        # The stock context-parallel attention (the backward's recompute) reads the global boundaries the stock
-        # backbone forward would have set.
-        from arctic_platform.model.implementations.glm53 import context_parallel
-
-        for layer in backbone.layers:
-            setattr(layer.self_attn, context_parallel._GLOBAL_POSITION_IDS, position_ids.reshape(1, -1))
-            setattr(layer.self_attn, context_parallel._GLOBAL_CU_SEQLENS, cu)
     turns = None
     if plan is not None:
         if mode == "stock" and torch.is_grad_enabled():
@@ -1647,6 +1648,23 @@ def aligned_logprobs(model: Any, input_ids: torch.Tensor, position_ids: torch.Te
         routes = None if routes is None else routes[turns.expand_index]
         position_ids = turns.positions
         labels = torch.where(scored, labels.reshape(-1)[turns.expand_index], -100)
+    tokens, shard, chunk = input_ids.numel(), None, 0
+    if group is not None:
+        # The rank's rows for the per-token operators: its own window, or with a plan an even share of the expanded
+        # spans (whose count need not divide by sp_size; the gathers pad each share to ``chunk`` rows).
+        rank, size = torch.distributed.get_rank(group), torch.distributed.get_world_size(group)
+        chunk = local if turns is None else -(-tokens // size)
+        shard = slice(min(rank * chunk, tokens), min((rank + 1) * chunk, tokens))
+        if turns is None:
+            # The stock context-parallel attention (the backward's recompute) reads the global boundaries the
+            # stock backbone forward would have set.
+            from arctic_platform.model.implementations.glm53 import context_parallel
+
+            for layer in backbone.layers:
+                setattr(layer.self_attn, context_parallel._GLOBAL_POSITION_IDS, position_ids.reshape(1, -1))
+                setattr(layer.self_attn, context_parallel._GLOBAL_CU_SEQLENS, cu)
+    local_ids = input_ids if shard is None else input_ids.reshape(-1)[shard].reshape(1, -1)
+    local_positions = position_ids if shard is None else position_ids.reshape(-1)[shard].reshape(1, -1)
     ctx = types.SimpleNamespace(config=config, positions=layout.positions if turns is None else turns.positions,
                                 cu_seqlens=cu if turns is None else turns.cu, turns=turns,
                                 routes=routes if shard is None or routes is None else routes[shard],
@@ -1655,7 +1673,7 @@ def aligned_logprobs(model: Any, input_ids: torch.Tensor, position_ids: torch.Te
                                 ep_group=getattr(model, "_vllm_aligned_ep_group", None),
                                 tp=getattr(model, "_vllm_aligned_tensor_parallel", 1),
                                 prefill_chunk=getattr(model, "_vllm_aligned_prefill_chunk", 0),
-                                sp_group=group, shard=shard)  # fmt: skip
+                                sp_group=group, shard=shard, sp_chunk=chunk, sp_tokens=tokens)  # fmt: skip
     if mode == "vllm_op":
         _log_memory(model, input_ids.numel())
         ctx.keep_moe_out = ctx.replay is not None
@@ -1679,7 +1697,13 @@ def aligned_logprobs(model: Any, input_ids: torch.Tensor, position_ids: torch.Te
     )
     if turns is None:
         return logprobs
-    return torch.where(turns.output_index >= 0, logprobs[turns.output_index.clamp(min=0)], 0.0)
+    if group is not None:
+        logprobs = _gather_rows(group, logprobs, chunk, tokens)
+    logprobs = torch.where(turns.output_index >= 0, logprobs[turns.output_index.clamp(min=0)], 0.0)
+    if group is not None:
+        rank = torch.distributed.get_rank(group)
+        return logprobs[rank * local : (rank + 1) * local]
+    return logprobs
 
 
 def _causal_lm_forward(self, input_ids=None, attention_mask=None, position_ids=None, labels=None, temperature=None,
@@ -1751,16 +1775,15 @@ def apply_vllm_aligned_glm5_next(model: Any, *, token_chunk_size: int, lm_head_f
     ``sp_group`` runs the forward sequence-parallel: each rank's contiguous window of the packed call goes through
     the per-token operators (hyper-connections, norms, MLP and MoE, LM head) on that rank, and every mixer (KDA,
     sparse MLA with its indexer) gathers its input from the group and runs on the whole sequence, so the logprobs
-    are those of sp_size 1. The backward recomputes the stock context-parallel layers on the rank's window. The
-    per-op backward and turn plans need sp_size 1.
+    are those of sp_size 1. The backward recomputes the stock context-parallel layers on the rank's window; the
+    per-op backward differentiates each mixer on the whole sequence (the gather sums the ranks' gradients). With a
+    turn plan the per-token operators take an even share of the expanded spans and the logprobs are gathered back.
     """
     if prefill_chunk < 0:
         raise ValueError("prefill_chunk must be non-negative")
     if backward not in ("stock", "vllm", "vllm_op"):
         raise ValueError(f"backward must be 'stock', 'vllm' or 'vllm_op', got {backward!r}")
     if sp_group is not None and torch.distributed.get_world_size(sp_group) > 1:
-        if backward == "vllm_op":
-            raise ValueError("the per-op backward differentiates every mixer kernel and needs sp_size 1")
         model._vllm_aligned_sp_group = sp_group
     import types
 
