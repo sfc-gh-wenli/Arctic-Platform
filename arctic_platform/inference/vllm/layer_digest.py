@@ -186,31 +186,43 @@ def _wrap_kpool_decode_update() -> None:
     kpool_compress.kpool_decode_update_and_maybe_write_cache_batched = update
 
 
+def _all_ranks(tensor: torch.Tensor) -> torch.Tensor:
+    """``tensor`` (``[tokens, local]``) gathered from every tensor-parallel rank along the last dim (rank-major), so a
+    digest covers every rank's heads, not only rank 0's. Every rank calls it, whether or not it records."""
+    from vllm.distributed import get_tensor_model_parallel_world_size
+    from vllm.distributed import tensor_model_parallel_all_gather
+
+    if get_tensor_model_parallel_world_size() == 1:
+        return tensor
+    return tensor_model_parallel_all_gather(tensor.contiguous(), dim=-1)
+
+
 def _kda_forward_with_digests(self, hidden_states: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-    """vLLM 0.32's ``Glm5NextLinearAttention.forward``, recording each stage (``kda.*#n``, n counting the step's
-    KDA layers): the merged projection, both gate projections, the conv + recurrent output, the gated norm, o_proj."""
+    """vLLM 0.32's ``Glm5NextLinearAttention.forward``, recording each stage gathered from every tensor-parallel rank
+    (``kda.*#n``, n counting the step's KDA layers): the merged projection, both gate projections, the conv + recurrent
+    output, the gated norm, this rank's o_proj partial and the all-reduced o_proj."""
     num_tokens = hidden_states.size(0)
     projected = self.in_proj_qkvbfg_a(hidden_states)[0]
-    record_numbered("kda.proj", projected)
+    record_numbered("kda.proj", _all_ranks(projected))
     qkv, beta_raw, f_a, g_a = projected.split(
         [3 * self.local_projection_size, self.local_num_heads, self.head_dim, self.head_dim], dim=-1
     )
     beta = beta_raw.unsqueeze(0)
     g1 = self.f_b_proj(f_a)[0]
-    record_numbered("kda.g1", g1)
+    record_numbered("kda.g1", _all_ranks(g1))
     g1 = g1.reshape(1, -1, self.local_num_heads, self.head_dim)
     g_proj_states = self.g_b_proj(g_a)[0]
-    record_numbered("kda.g2", g_proj_states)
+    record_numbered("kda.g2", _all_ranks(g_proj_states))
     g2 = g_proj_states.reshape(-1, self.local_num_heads, self.head_dim)
     core_attn_out = torch.empty((1, num_tokens, self.local_num_heads, self.head_dim), dtype=hidden_states.dtype,
                                 device=hidden_states.device)  # fmt: skip
     self._forward(qkv_proj_states=qkv, g1=g1, beta=beta, core_attn_out=core_attn_out)
-    record_numbered("kda.core", core_attn_out.reshape(num_tokens, -1))
+    record_numbered("kda.core", _all_ranks(core_attn_out.reshape(num_tokens, -1)))
     core_attn_out = self.o_norm(core_attn_out, g2)
-    record_numbered("kda.norm", core_attn_out.reshape(num_tokens, -1))
     o_in = core_attn_out.reshape(core_attn_out.size(1), -1)
-    # This rank's o_proj partial before the all-reduce (computed again only to digest it).
-    record_numbered("kda.o_proj_partial", self.o_proj.quant_method.apply(self.o_proj, o_in))
+    record_numbered("kda.norm", _all_ranks(o_in))
+    # Each rank's o_proj partial before the all-reduce (computed again only to digest it).
+    record_numbered("kda.o_proj_partial", _all_ranks(self.o_proj.quant_method.apply(self.o_proj, o_in)))
     out = self.o_proj(o_in)[0]
     record_numbered("kda.o_proj", out)
     return out
