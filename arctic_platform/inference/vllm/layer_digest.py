@@ -186,6 +186,33 @@ def _wrap_kpool_decode_update() -> None:
     kpool_compress.kpool_decode_update_and_maybe_write_cache_batched = update
 
 
+def _kda_forward_with_digests(self, hidden_states: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    """vLLM 0.32's ``Glm5NextLinearAttention.forward``, recording each stage (``kda.*#n``, n counting the step's
+    KDA layers): the merged projection, both gate projections, the conv + recurrent output, the gated norm, o_proj."""
+    num_tokens = hidden_states.size(0)
+    projected = self.in_proj_qkvbfg_a(hidden_states)[0]
+    record_numbered("kda.proj", projected)
+    qkv, beta_raw, f_a, g_a = projected.split(
+        [3 * self.local_projection_size, self.local_num_heads, self.head_dim, self.head_dim], dim=-1
+    )
+    beta = beta_raw.unsqueeze(0)
+    g1 = self.f_b_proj(f_a)[0]
+    record_numbered("kda.g1", g1)
+    g1 = g1.reshape(1, -1, self.local_num_heads, self.head_dim)
+    g_proj_states = self.g_b_proj(g_a)[0]
+    record_numbered("kda.g2", g_proj_states)
+    g2 = g_proj_states.reshape(-1, self.local_num_heads, self.head_dim)
+    core_attn_out = torch.empty((1, num_tokens, self.local_num_heads, self.head_dim), dtype=hidden_states.dtype,
+                                device=hidden_states.device)  # fmt: skip
+    self._forward(qkv_proj_states=qkv, g1=g1, beta=beta, core_attn_out=core_attn_out)
+    record_numbered("kda.core", core_attn_out.reshape(num_tokens, -1))
+    core_attn_out = self.o_norm(core_attn_out, g2)
+    record_numbered("kda.norm", core_attn_out.reshape(num_tokens, -1))
+    out = self.o_proj(core_attn_out.reshape(core_attn_out.size(1), -1))[0]
+    record_numbered("kda.o_proj", out)
+    return out
+
+
 def ensure_layer_digest() -> None:
     global _APPLIED
     directory = os.environ.get(DIR_ENV)
@@ -262,6 +289,7 @@ def ensure_layer_digest() -> None:
     from vllm.models.glm5next.common.attention import Glm5NextMLAAttention
     from vllm.models.glm5next.common.kda import Glm5NextLinearAttention
 
+    Glm5NextLinearAttention.forward = _kda_forward_with_digests
     for cls in (Glm5NextMLAAttention, Glm5NextLinearAttention):
         _wrap(cls, "forward", lambda self, cls=cls: f"{cls.__name__}@{id(self):x}")
         _wrap(cls, "forward", lambda self, cls=cls: cls.__name__, dump=True)
