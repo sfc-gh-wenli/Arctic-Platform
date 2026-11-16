@@ -528,34 +528,23 @@ def _fixed_order_tp_all_reduce() -> None:
     CudaCommunicator.all_reduce = all_reduce
 
 
-def _per_sequence_kda_decode() -> None:
-    """Run a pure decode step's ``fused_recurrent_kda`` one sequence at a time.
+def _contiguous_kda_decode_inputs() -> None:
+    """Give the decode step's ``fused_recurrent_kda`` contiguous q/k/v.
 
-    At TP 8 (8 KDA heads per rank) the varlen kernel's output for a sequence depends on the other sequences of the
-    step, though each program reads only its own sequence's inputs (layer digests: identical q/k/v, gates and state,
-    a different output). A one-sequence call is what every batch size then reduces to. A decode step has one token per
-    sequence, so the slices need no host sync and CUDA graphs capture the loop."""
+    The kernel takes q/k/v as column views of the merged projection, whose token stride is its row width:
+    ``3 * heads * 128 + heads + 256``, 3336 at TP 8. Triton compiles a separate variant for an integer argument that
+    is not a multiple of 16, with another reduction order, so its outputs differ in rounding. A one-token step reports
+    a token stride of ``heads * 128`` instead (any stride is valid for a size-1 dim), so the same request decoded alone
+    and batched took different variants. Contiguous q/k/v give every step, and the trainer, the ``heads * 128`` one.
+    At TP 1 and 4 the row width is a multiple of 16 and this changes no bits."""
     from vllm.models.glm5next.common import kda as kda_module
 
     original = kda_module.fused_recurrent_kda
 
     def fused_recurrent_kda(*args, **kwargs):
-        cu, q = kwargs.get("cu_seqlens"), kwargs.get("q")
-        if args or cu is None or q is None or kwargs.get("num_accepted_tokens") is not None:
-            return original(*args, **kwargs)
-        sequences = cu.numel() - 1
-        if sequences <= 1 or q.shape[1] != sequences:
-            return original(**kwargs)
-        out = kwargs.get("out")
-        if out is None:
-            out = torch.empty(kwargs["k"].shape, dtype=kwargs["k"].dtype, device=q.device)
-        indices = kwargs["ssm_state_indices"]
-        for n in range(sequences):
-            one = slice(n, n + 1)
-            original(**{**kwargs, "q": q[:, one], "k": kwargs["k"][:, one], "v": kwargs["v"][:, one],
-                        "g": kwargs["g"][:, one], "beta": kwargs["beta"][:, one], "cu_seqlens": cu[n : n + 2] - cu[n],
-                        "ssm_state_indices": indices[one], "out": out[:, one]})  # fmt: skip
-        return out, kwargs["initial_state"]
+        if not args:
+            kwargs = {**kwargs, **{n: kwargs[n].contiguous() for n in ("q", "k", "v") if torch.is_tensor(kwargs.get(n))}}
+        return original(*args, **kwargs)
 
     kda_module.fused_recurrent_kda = fused_recurrent_kda
 
@@ -578,7 +567,7 @@ PROXY_ENV_VAR = "ARCTIC_GLM5_PROXY_LAYERS"
 SKIP_ENV_VAR = "ARCTIC_GLM5_BI_SKIP"
 PATCHES = ("gdn", "one_split", "mhc_split", "mhc_unfused", "router_gate", "mla_mqa", "fp8_linear", "kda_mixed",
            "indexer_topk", "causal_rows", "indexer_knorm", "indexer_weights", "grouped_topk", "kda_pin",
-           "moe_config", "kpool_chunks", "kda_checkpoints", "tp_allreduce", "kda_decode_per_seq")  # fmt: skip
+           "moe_config", "kpool_chunks", "kda_checkpoints", "tp_allreduce", "kda_decode_strides")  # fmt: skip
 
 
 def _load_proxy_layers_only(num_layers: int) -> None:
@@ -646,7 +635,7 @@ def ensure_glm5_batch_invariance() -> None:
                         ("indexer_weights", _batch_invariant_indexer_head_weights),
                         ("moe_config", _fixed_fp8_block_moe_config), ("kpool_chunks", _kpool_aligned_chunks),
                         ("kda_checkpoints", _no_kda_prefill_checkpoints), ("tp_allreduce", _fixed_order_tp_all_reduce),
-                        ("kda_decode_per_seq", _per_sequence_kda_decode)):  # fmt: skip
+                        ("kda_decode_strides", _contiguous_kda_decode_inputs)):  # fmt: skip
         if name not in skip:
             apply()
     if "grouped_topk" not in skip:
