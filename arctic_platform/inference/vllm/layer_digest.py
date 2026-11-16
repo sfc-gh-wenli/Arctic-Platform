@@ -352,6 +352,10 @@ def ensure_layer_digest() -> None:
                 record_numbered("kda.recurrent_isolated", _all_ranks(isolated.reshape(tokens, -1)))
                 for name in ("q", "k", "v", "g", "beta"):
                     record_numbered(f"kda.arg_{name}", _all_ranks(kwargs[name][0].reshape(tokens, -1)))
+                for name in ("a_log", "g_bias"):
+                    if torch.is_tensor(kwargs.get(name)):
+                        param = kwargs[name].reshape(1, -1).expand(tokens, -1)
+                        record_numbered(f"kda.arg_{name}", _all_ranks(param))
                 # Each sequence as its own step: fresh contiguous one-token buffers and state.
                 cu_one = torch.tensor([0, 1], dtype=kwargs["cu_seqlens"].dtype, device=indices.device)
                 fresh = []
