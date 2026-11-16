@@ -350,6 +350,18 @@ def ensure_layer_digest() -> None:
                 isolated, _ = original_recurrent(**{**kwargs, "initial_state": scratch, "ssm_state_indices": slots,
                                                     "out": None})  # fmt: skip
                 record_numbered("kda.recurrent_isolated", _all_ranks(isolated.reshape(tokens, -1)))
+                for name in ("q", "k", "v", "g", "beta"):
+                    record_numbered(f"kda.arg_{name}", _all_ranks(kwargs[name][0].reshape(tokens, -1)))
+                # Each sequence as its own step: fresh contiguous one-token buffers and state.
+                cu_one = torch.tensor([0, 1], dtype=kwargs["cu_seqlens"].dtype, device=indices.device)
+                fresh = []
+                for n in range(tokens):
+                    one = {name: kwargs[name][:, n:n + 1].contiguous() for name in ("q", "k", "v", "g", "beta")}
+                    alone_state = torch.cat([torch.zeros_like(state[:1]), state[flat[n:n + 1]].clone()])
+                    o, _ = original_recurrent(**{**kwargs, **one, "initial_state": alone_state, "cu_seqlens": cu_one,
+                                                 "ssm_state_indices": slots[:1], "out": None})  # fmt: skip
+                    fresh.append(o)
+                record_numbered("kda.recurrent_fresh", _all_ranks(torch.cat(fresh, 1).reshape(tokens, -1)))
                 if _state["digests"] is not None:
                     aux = _state.setdefault("aux", [])
                     aux.append({"layer": _state.get("layer"), "indices": indices[:tokens].tolist(),
@@ -358,7 +370,13 @@ def ensure_layer_digest() -> None:
         out = original_recurrent(*args, **kwargs)
         o = out[0] if isinstance(out, tuple) else out
         if tokens:
-            record_numbered("kda.recurrent_out", _all_ranks(o.reshape(tokens, -1)))
+            gathered = _all_ranks(o.reshape(tokens, -1))
+            record_numbered("kda.recurrent_out", gathered)
+            if state is not None and indices is not None and indices.dim() == 1:
+                from vllm.distributed import get_tensor_model_parallel_world_size
+
+                for r, part in enumerate(gathered.chunk(get_tensor_model_parallel_world_size(), dim=-1)):
+                    record_numbered(f"kda.recurrent_out_r{r}", part)
         return out
 
     kda_module.causal_conv1d_update = causal_conv1d_update
