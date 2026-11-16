@@ -208,7 +208,10 @@ def _kda_forward_with_digests(self, hidden_states: torch.Tensor, positions: torc
     record_numbered("kda.core", core_attn_out.reshape(num_tokens, -1))
     core_attn_out = self.o_norm(core_attn_out, g2)
     record_numbered("kda.norm", core_attn_out.reshape(num_tokens, -1))
-    out = self.o_proj(core_attn_out.reshape(core_attn_out.size(1), -1))[0]
+    o_in = core_attn_out.reshape(core_attn_out.size(1), -1)
+    # This rank's o_proj partial before the all-reduce (computed again only to digest it).
+    record_numbered("kda.o_proj_partial", self.o_proj.quant_method.apply(self.o_proj, o_in))
+    out = self.o_proj(o_in)[0]
     record_numbered("kda.o_proj", out)
     return out
 
