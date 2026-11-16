@@ -296,14 +296,18 @@ def _kda_core_kernel(q, k, v, g, beta, a_log, dt_bias, *, layout: Any, lower_bou
             recurrent[slot] = saved[key]
         rows = step.rows
         if step.decode:
-            slots = step.slots[:, None].expand(step.slots.numel(), max(step.max_len, 1)).contiguous()
-            out, _ = fused_recurrent_kda(
-                q=q[:, rows], k=k[:, rows], v=v[:, rows], g=g[:, rows], beta=beta[rows].unsqueeze(0),
-                initial_state=recurrent, use_qk_l2norm_in_kernel=True, cu_seqlens=step.cu, ssm_state_indices=slots,
-                sigmoid_beta=True, a_log=a_log.reshape(1, 1, heads, 1), g_bias=dt_bias, compute_gate=True,
-                lower_bound=lower_bound,
-            )  # fmt: skip
-            core[:, rows] = out.to(core.dtype)
+            # One call per request, as the sampler runs a decode step (``kda_decode_per_seq``).
+            bounds = step.cu.tolist()
+            for n in range(len(bounds) - 1):
+                own = rows[bounds[n] : bounds[n + 1]]
+                slots = step.slots[n : n + 1, None].expand(1, max(own.numel(), 1)).contiguous()
+                out, _ = fused_recurrent_kda(
+                    q=q[:, own], k=k[:, own], v=v[:, own], g=g[:, own], beta=beta[own].unsqueeze(0),
+                    initial_state=recurrent, use_qk_l2norm_in_kernel=True,
+                    cu_seqlens=step.cu[n : n + 2] - step.cu[n], ssm_state_indices=slots, sigmoid_beta=True,
+                    a_log=a_log.reshape(1, 1, heads, 1), g_bias=dt_bias, compute_gate=True, lower_bound=lower_bound,
+                )  # fmt: skip
+                core[:, own] = out.to(core.dtype)
         else:
             core[:, rows] = prefill(step, q[:, rows], k[:, rows], v[:, rows], g[:, rows], beta[rows])
         for slot, key in step.exports:

@@ -528,6 +528,38 @@ def _fixed_order_tp_all_reduce() -> None:
     CudaCommunicator.all_reduce = all_reduce
 
 
+def _per_sequence_kda_decode() -> None:
+    """Run a pure decode step's ``fused_recurrent_kda`` one sequence at a time.
+
+    At TP 8 (8 KDA heads per rank) the varlen kernel's output for a sequence depends on the other sequences of the
+    step, though each program reads only its own sequence's inputs (layer digests: identical q/k/v, gates and state,
+    a different output). A one-sequence call is what every batch size then reduces to. A decode step has one token per
+    sequence, so the slices need no host sync and CUDA graphs capture the loop."""
+    from vllm.models.glm5next.common import kda as kda_module
+
+    original = kda_module.fused_recurrent_kda
+
+    def fused_recurrent_kda(*args, **kwargs):
+        cu, q = kwargs.get("cu_seqlens"), kwargs.get("q")
+        if args or cu is None or q is None or kwargs.get("num_accepted_tokens") is not None:
+            return original(*args, **kwargs)
+        sequences = cu.numel() - 1
+        if sequences <= 1 or q.shape[1] != sequences:
+            return original(**kwargs)
+        out = kwargs.get("out")
+        if out is None:
+            out = torch.empty(kwargs["k"].shape, dtype=kwargs["k"].dtype, device=q.device)
+        indices = kwargs["ssm_state_indices"]
+        for n in range(sequences):
+            one = slice(n, n + 1)
+            original(**{**kwargs, "q": q[:, one], "k": kwargs["k"][:, one], "v": kwargs["v"][:, one],
+                        "g": kwargs["g"][:, one], "beta": kwargs["beta"][:, one], "cu_seqlens": cu[n : n + 2] - cu[n],
+                        "ssm_state_indices": indices[one], "out": out[:, one]})  # fmt: skip
+        return out, kwargs["initial_state"]
+
+    kda_module.fused_recurrent_kda = fused_recurrent_kda
+
+
 def _sparse_mla_always_mqa() -> None:
     """Run every sparse MLA token through the absorbed ``forward_mqa`` path.
 
@@ -546,7 +578,7 @@ PROXY_ENV_VAR = "ARCTIC_GLM5_PROXY_LAYERS"
 SKIP_ENV_VAR = "ARCTIC_GLM5_BI_SKIP"
 PATCHES = ("gdn", "one_split", "mhc_split", "mhc_unfused", "router_gate", "mla_mqa", "fp8_linear", "kda_mixed",
            "indexer_topk", "causal_rows", "indexer_knorm", "indexer_weights", "grouped_topk", "kda_pin",
-           "moe_config", "kpool_chunks", "kda_checkpoints", "tp_allreduce")  # fmt: skip
+           "moe_config", "kpool_chunks", "kda_checkpoints", "tp_allreduce", "kda_decode_per_seq")  # fmt: skip
 
 
 def _load_proxy_layers_only(num_layers: int) -> None:
@@ -613,7 +645,8 @@ def ensure_glm5_batch_invariance() -> None:
                         ("indexer_knorm", _eager_indexer_k_norm),
                         ("indexer_weights", _batch_invariant_indexer_head_weights),
                         ("moe_config", _fixed_fp8_block_moe_config), ("kpool_chunks", _kpool_aligned_chunks),
-                        ("kda_checkpoints", _no_kda_prefill_checkpoints), ("tp_allreduce", _fixed_order_tp_all_reduce)):  # fmt: skip
+                        ("kda_checkpoints", _no_kda_prefill_checkpoints), ("tp_allreduce", _fixed_order_tp_all_reduce),
+                        ("kda_decode_per_seq", _per_sequence_kda_decode)):  # fmt: skip
         if name not in skip:
             apply()
     if "grouped_topk" not in skip:
