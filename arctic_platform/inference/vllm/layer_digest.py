@@ -29,6 +29,9 @@ import torch
 
 DIR_ENV = "ARCTIC_LAYER_DIGEST_DIR"
 STEPS_ENV = "ARCTIC_LAYER_DIGEST_MAX_STEPS"
+# Debug: every rank saves the raw arguments and output of each forward's first KDA decode call (of at most 4 tokens)
+# here, as fwd<forward>_rank<rank>.pt (forward numbered as the digest steps).
+KDA_DUMP_ENV = "ARCTIC_KDA_DUMP_DIR"
 _LAYER_OPS = ("hc_pre", "hc_fused_post_pre", "hc_post")
 _APPLIED = False
 _state: dict = {"step": 0, "digests": None}
@@ -249,10 +252,12 @@ def ensure_layer_digest() -> None:
             dump_rows = int(os.environ.get(DUMP_ROWS_ENV, "0"))
             _state["dump"] = {} if 0 < _state["rows"] <= dump_rows else None
             _state["dump_counts"] = {}
+        _state["kda_calls"] = 0
         try:
             out = original_forward(self, input_ids, positions, *args, **kwargs)
             _record("model_out", out)
         finally:
+            _state["fwd"] = _state.get("fwd", 0) + 1
             if record:
                 os.makedirs(directory, exist_ok=True)
                 torch.save(
@@ -371,8 +376,31 @@ def ensure_layer_digest() -> None:
                     aux.append({"layer": _state.get("layer"), "indices": indices[:tokens].tolist(),
                                 "state_shape": list(state.shape), "state_stride": list(state.stride()),
                                 "contiguous_rows": bool(state[0].is_contiguous())})  # fmt: skip
+        dump = None
+        call = _state.get("kda_calls", 0)
+        _state["kda_calls"] = call + 1
+        if (os.environ.get(KDA_DUMP_ENV) and call == 0 and tokens and tokens <= 4 and not args
+                and state is not None and indices is not None and indices.dim() == 1):  # fmt: skip
+            flat = indices.reshape(-1).long().clamp(min=0)[:tokens]
+            dump = {name: kwargs[name].detach().contiguous().cpu() for name in ("q", "k", "v", "g", "beta", "a_log",
+                                                                                "g_bias", "cu_seqlens")
+                    if torch.is_tensor(kwargs.get(name))}  # fmt: skip
+            dump["strides"] = {name: list(kwargs[name].stride()) for name in ("q", "k", "v", "g", "beta")}
+            dump["data_ptr_mod16"] = {name: kwargs[name].data_ptr() % 16 for name in ("q", "k", "v", "g", "beta")}
+            dump["scalars"] = {k: v for k, v in kwargs.items() if isinstance(v, (bool, int, float)) or v is None}
+            dump["indices"] = indices[:tokens].cpu()
+            dump["state_rows"] = state[flat].detach().cpu()
+            dump["state_shape"], dump["state_stride"] = list(state.shape), list(state.stride())
         out = original_recurrent(*args, **kwargs)
         o = out[0] if isinstance(out, tuple) else out
+        if dump is not None:
+            from vllm.distributed import get_tensor_model_parallel_rank
+
+            dump["out"] = o.detach().contiguous().cpu()
+            dump["state_rows_after"] = state[indices.reshape(-1).long().clamp(min=0)[:tokens]].detach().cpu()
+            directory = os.environ[KDA_DUMP_ENV]
+            os.makedirs(directory, exist_ok=True)
+            torch.save(dump, os.path.join(directory, f"fwd{_state.get('fwd', 0):05d}_rank{get_tensor_model_parallel_rank()}.pt"))
         if tokens:
             gathered = _all_ranks(o.reshape(tokens, -1))
             record_numbered("kda.recurrent_out", gathered)
