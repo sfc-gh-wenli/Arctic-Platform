@@ -323,6 +323,32 @@ def ensure_layer_digest() -> None:
         return out
 
     kda_module.causal_conv1d_fn = causal_conv1d_fn
+    original_update, original_recurrent = kda_module.causal_conv1d_update, kda_module.fused_recurrent_kda
+
+    def causal_conv1d_update(x, conv_state, *args, conv_state_indices=None, **kwargs):
+        # Decode: the conv state rows this step reads, then the conv output (every rank's channels).
+        if conv_state_indices is not None:
+            rows = conv_state[conv_state_indices.long().clamp(min=0)[: x.shape[0]]]
+            record_numbered("kda.conv_state_in", _all_ranks(rows.reshape(x.shape[0], -1)))
+        out = original_update(x, conv_state, *args, conv_state_indices=conv_state_indices, **kwargs)
+        record_numbered("kda.conv_out", _all_ranks(out.reshape(x.shape[0], -1)))
+        return out
+
+    def fused_recurrent_kda(*args, **kwargs):
+        state, indices = kwargs.get("initial_state"), kwargs.get("ssm_state_indices")
+        q = kwargs.get("q", args[0] if args else None)
+        tokens = q.shape[1] if q is not None and q.dim() == 4 else None
+        if state is not None and indices is not None and tokens:
+            flat = indices.reshape(-1).long().clamp(min=0)[:tokens]
+            record_numbered("kda.state_in", _all_ranks(state[flat].reshape(tokens, -1)))
+        out = original_recurrent(*args, **kwargs)
+        o = out[0] if isinstance(out, tuple) else out
+        if tokens:
+            record_numbered("kda.recurrent_out", _all_ranks(o.reshape(tokens, -1)))
+        return out
+
+    kda_module.causal_conv1d_update = causal_conv1d_update
+    kda_module.fused_recurrent_kda = fused_recurrent_kda
     from vllm.model_executor.layers.fused_moe.router.fused_moe_router import FusedMoERouter
     from vllm.model_executor.layers.fused_moe.router.gate_linear import GateLinear
     from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
