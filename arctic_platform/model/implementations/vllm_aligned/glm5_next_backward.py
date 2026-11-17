@@ -98,12 +98,21 @@ def fake_fp8(x: torch.Tensor, ue8m0: bool) -> torch.Tensor:
 # ---- references (fp32 math, results in the kernel's output dtypes) ----
 
 
+def _mm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """``a @ b`` in fp32: with fused references (:func:`_fused`) from bf16 operands with fp32 accumulation, as the
+    stock trainer's backward multiplies (batch-invariant mode turns TF32 off, so an fp32 GEMM is ~15x slower);
+    otherwise from fp32 operands. Only the gradient of a reference is used, never its value."""
+    if _fused(a, b):
+        return torch.matmul(a.to(torch.bfloat16), b.to(torch.bfloat16)).float()
+    return a.float() @ b.float()
+
+
 def ref_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    return (x.float() @ weight.float().t()).to(x.dtype)
+    return _mm(x, weight.t()).to(x.dtype)
 
 
 def ref_linear_fp32_out(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    return x.float() @ weight.float().t()
+    return _mm(x, weight.t())
 
 
 def ref_add_lora(y: torch.Tensor, x: torch.Tensor, *factors: torch.Tensor, slices: tuple[int, ...], **_) -> torch.Tensor:
@@ -111,7 +120,7 @@ def ref_add_lora(y: torch.Tensor, x: torch.Tensor, *factors: torch.Tensor, slice
     deltas = []
     for i, width in enumerate(slices):
         a, b = factors[2 * i], factors[2 * i + 1]
-        d = (x.float() @ a.float().t()) @ b.float().t()
+        d = _mm(_mm(x, a.t()), b.t())
         if d.shape[-1] < width:
             d = F.pad(d, (0, width - d.shape[-1]))
         deltas.append(d)
@@ -269,16 +278,78 @@ def _kda_pieces(q, k, v, g, beta, pieces, h, a_amp, g_bias, lower_bound, scale, 
     return torch.cat(out, dim=1)[valid], h
 
 
+FUSED_ENV = "ARCTIC_VLLM_ALIGNED_FUSED_REFERENCES"
+
+
+def _fused(*tensors: torch.Tensor) -> bool:
+    """Whether the references run fast: the KDA and sparse MLA ones as fused kernels (FLA's ``chunk_kda``, FlashMLA
+    with its fused backward), the matmuls of the others from bf16 operands (:func:`_mm`); on CUDA unless
+    ``ARCTIC_VLLM_ALIGNED_FUSED_REFERENCES=0``. Same math; the gradients agree with the fp32 references to a cosine
+    of 0.99999 at 17-137x (KDA) and 14-47x (sparse MLA) the speed of those two on long rows."""
+    import os
+
+    return os.environ.get(FUSED_ENV, "1") != "0" and all(t.is_cuda for t in tensors)
+
+
+def _fla_kda_core(q, k, v, g, beta, a_log, dt_bias, cu_seqlens, lower_bound: float, layout=None) -> torch.Tensor:
+    """:func:`ref_kda_core` by FLA's ``chunk_kda``: vLLM's bounded gate and sigmoid beta computed here, then the
+    gated delta rule with l2-normalized q/k and FLA's chunked forward and backward. A turn plan's spans run level by
+    level and cut by cut as in the reference, each batch of pieces one varlen call from the states its spans reached
+    (FLA's ``[H, K, V]`` layout), so a resumed span's gradient reaches its provider through ``initial_state``."""
+    from fla.ops.kda import chunk_kda
+
+    q, k, v, g = (t.reshape(t.shape[-3:]) for t in (q, k, v, g))
+    heads, dim, dtype = *q.shape[1:], q.dtype
+    gate = lower_bound / (1.0 + torch.exp(-(torch.exp(a_log.float()).reshape(heads, 1)
+                                            * (g.float() + dt_bias.float().reshape(heads, dim)))))  # fmt: skip
+    b = torch.sigmoid(beta.float())
+
+    def call(index, cu, h0):
+        pick = (lambda t: t.contiguous()[None]) if index is None else (lambda t: t[index][None])  # noqa: E731
+        out, ht = chunk_kda(pick(q), pick(k), pick(v), g=pick(gate), beta=pick(b), initial_state=h0,
+                            output_final_state=h0 is not None, use_qk_l2norm_in_kernel=True, cu_seqlens=cu)  # fmt: skip
+        return out[0], ht
+
+    spans = _resumed_spans(layout)
+    if spans is None:
+        return call(None, cu_seqlens.to(torch.long), None)[0].to(dtype)
+    wanted = {resume for _, _, resume in spans if resume is not None}
+    cuts = [sorted({offset for span, offset in wanted if span == i} | {length}) for i, (_, length, _) in enumerate(spans)]
+    levels: list[int] = []
+    for _, _, resume in spans:
+        levels.append(0 if resume is None else levels[resume[0]] + 1)
+    saved, outputs = {}, [[] for _ in spans]
+    zero = q.new_zeros((heads, dim, v.shape[-1]), dtype=torch.float32)
+    for level in range(max(levels) + 1):
+        members = [i for i, value in enumerate(levels) if value == level]
+        state = {i: zero if spans[i][2] is None else saved[spans[i][2]] for i in members}
+        done = {i: 0 for i in members}
+        for j in range(max(len(cuts[i]) for i in members)):
+            batch = [i for i in members if j < len(cuts[i])]
+            pieces = [(spans[i][0] + done[i], spans[i][0] + cuts[i][j]) for i in batch]
+            index = torch.cat([torch.arange(lo, hi, device=q.device) for lo, hi in pieces])
+            lengths = torch.tensor([0] + [hi - lo for lo, hi in pieces])
+            out, ht = call(index, torch.cumsum(lengths, 0).to(q.device), torch.stack([state[i] for i in batch]))
+            for i, o, h_i in zip(batch, out.split([hi - lo for lo, hi in pieces]), ht):
+                outputs[i].append(o)
+                state[i], done[i] = h_i, cuts[i][j]
+                saved[(i, cuts[i][j])] = h_i
+    return torch.cat([o for span_out in outputs for o in span_out]).to(dtype)
+
+
 def ref_kda_core(q, k, v, g, beta, a_log, dt_bias, cu_seqlens, lower_bound: float, chunk: int = 64,
                  stepwise: bool = False, layout=None, **_):
     """The KDA core over packed requests from a zero state: ``q/k/v/g [(1,) T, H, D]``, ``beta [T, H]`` raw logits,
-    ``a_log [H]``, ``dt_bias [H * D]``; returns ``[T, H, D]`` in ``q``'s dtype. The requests step together, padded
-    to the longest (a padded position's output is dropped, so it gets no gradient), ``chunk`` tokens at a time in the
-    chunked form (:func:`_kda_chunk`; ``stepwise``: token by token, :func:`_kda_steps`), checkpointed per chunk.
+    ``a_log [H]``, ``dt_bias [H * D]``; returns ``[T, H, D]`` in ``q``'s dtype. On CUDA by FLA's fused kernels
+    (:func:`_fla_kda_core`); otherwise the requests step together, padded to the longest (a padded position's output
+    is dropped, so it gets no gradient), ``chunk`` tokens at a time in the chunked form (:func:`_kda_chunk`;
+    ``stepwise``: token by token, :func:`_kda_steps`), checkpointed per chunk.
 
     With a turn plan's spans (``layout.spans``) a span resuming at offset ``o`` of its provider starts from the
     provider's state after its first ``o`` tokens, so its gradient flows back into the provider's tokens; spans run
     level by level, each cut where other spans resume from it."""
+    if not stepwise and _fused(q):
+        return _fla_kda_core(q, k, v, g, beta, a_log, dt_bias, cu_seqlens, lower_bound, layout)
     q, k, v, g = (t.reshape(t.shape[-3:]) for t in (q, k, v, g))
     heads, dim, dtype = *q.shape[1:], q.dtype
     args = (torch.exp(a_log.float()).reshape(heads, 1), dt_bias.float().reshape(heads, dim), lower_bound, dim**-0.5,
@@ -327,15 +398,44 @@ def _causal_mla(q_rope, q_v, k, v, softmax_scale):
     return torch.einsum("nts,sl->tnl", probs, v)
 
 
+def _fused_sparse_mla(q_v, v_cache, rows, softmax_scale: float) -> torch.Tensor | None:
+    """:func:`ref_sparse_mla` without its rope term by FlashMLA's sparse attention and the fused TileLang backward
+    (the stock trainer's, on the 512-wide latent): each token's rows, ``-1`` sent to a zero sentinel row. ``None``
+    where those kernels are not available."""
+    from arctic_platform.model.implementations.glm52.models.glm_moe_dsa.sparse_mla_attention import (
+        fused_sparse_mla_backward_available,
+    )
+    from arctic_platform.model.implementations.glm52.models.glm_moe_dsa.sparse_mla_attention import (
+        sparse_mla_flashmla_fused_apply,
+    )
+    from arctic_platform.model.implementations.glm52.models.kernels.sparse_mla_flashmla import flash_mla_available
+
+    if not (flash_mla_available() and fused_sparse_mla_backward_available()):
+        return None
+    latent = v_cache.reshape(v_cache.shape[0], -1)
+    kv = torch.cat([latent, latent.new_zeros((1, latent.shape[1]))])[None, :, None, :]
+    width = -(-rows.shape[1] // 128) * 128  # the kernels tile the top-k in 128 columns
+    index = torch.nn.functional.pad(rows, (0, width - rows.shape[1]), value=-1)
+    index = index.masked_fill(index < 0, latent.shape[0]).to(torch.int32)[None, :, None, :]
+    return sparse_mla_flashmla_fused_apply(q_v[None], kv, index, softmax_scale)[0].to(q_v.dtype)
+
+
 def ref_sparse_mla(q_rope, k_cache, v_cache, q_v, rows, valid, softmax_scale: float, chunk: int = 128, **_):
     """FA3's sparse QV attention as vLLM calls it: token ``t`` attends to the rows ``rows[t, :valid[t]]`` of the
     one-token pages, ``softmax((q_rope . k + q_v . v) * scale) v``; ``q_rope [T, N, R]``, ``q_v [T, N, L]``,
     ``k_cache [rows, 1, 1, R]``, ``v_cache [rows, 1, 1, L]``. Returns ``[T, N, L]``.
 
-    A token whose rows are every token from its own row ``t - valid[t] + 1`` through ``t`` in order (each token below
-    ``index_topk``) attends causally within its sequence, so each sequence's run of such tokens is one dense causal
-    attention; the other tokens gather their rows, checkpointed per ``chunk`` tokens."""
+    On CUDA, when the rope term is zero (``mla_use_nope``: a zero query, or the zero keys of vLLM's zero-padded
+    ``kv_a`` rows), by FlashMLA and its fused backward (:func:`_fused_sparse_mla`). Otherwise a token whose rows are
+    every token from its own row ``t - valid[t] + 1`` through ``t`` in order (each token below ``index_topk``)
+    attends causally within its sequence, so each sequence's run of such tokens is one dense causal attention; the
+    other tokens gather their rows, checkpointed per ``chunk`` tokens."""
     from torch.utils.checkpoint import checkpoint
+
+    if _fused(q_v) and (not torch.count_nonzero(q_rope) or not torch.count_nonzero(k_cache)):
+        fused = _fused_sparse_mla(q_v, v_cache, rows, softmax_scale)
+        if fused is not None:
+            return fused
 
     k_all, v_all = k_cache.reshape(k_cache.shape[0], -1).float(), v_cache.reshape(v_cache.shape[0], -1).float()
     tokens, width = rows.shape
@@ -427,12 +527,12 @@ def ref_fp8_linear(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor, b
     from arctic_platform.model.implementations.fp8 import dequantize_from_fp8_blockwise
 
     w = dequantize_from_fp8_blockwise(weight, scale, block, torch.float32)
-    return (fake_fp8(x, False) @ w.t()).to(x.dtype)
+    return _mm(fake_fp8(x, False), w.t()).to(x.dtype)
 
 
 def ref_head_bmm(a: torch.Tensor, b: torch.Tensor, **_) -> torch.Tensor:
     """``a [heads, tokens, i] @ b [heads, i, o]`` as ``[tokens, heads, o]``."""
-    return torch.bmm(a.float(), b.float()).transpose(0, 1).to(a.dtype)
+    return _mm(a, b).transpose(0, 1).to(a.dtype)
 
 
 def ref_q_kv_rmsnorm(q: torch.Tensor, kv: torch.Tensor, q_weight: torch.Tensor, kv_weight: torch.Tensor,
