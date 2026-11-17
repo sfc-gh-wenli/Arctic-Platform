@@ -777,12 +777,38 @@ def test_sequence_parallel_mixer_runs_the_whole_sequence_and_keeps_the_shards_ro
             record["topk"] = torch.arange(8 * 2).reshape(8, 2)
         return x * 10
 
+    def partials(attn, x, positions, cu_seqlens, config, record, tp, keys, ranks):
+        return [sparse_attention(attn, x, positions, cu_seqlens, config, record, tp, keys)]
+
+    def all_to_all_single(output, input, output_split_sizes, input_split_sizes, group=None):
+        output.copy_(input)
+
+    # One sequence-parallel rank holding the second half of the sequence (its peer's half is all it gathers).
     monkeypatch.setattr(glm5_next, "_gather_rows", lambda group, x, chunk, total: whole)
-    monkeypatch.setattr(glm5_next, "mla_attention", sparse_attention)
+    monkeypatch.setattr(glm5_next, "mla_partials", partials)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 1)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
+    monkeypatch.setattr(torch.distributed, "all_to_all_single", all_to_all_single)
     layer = types.SimpleNamespace(block_type="deepseek_sparse_attention", self_attn=None)
     ctx = types.SimpleNamespace(config=None, positions=None, cu_seqlens=None, turns=None, replay={}, sp_group=object(),
-                                shard=shard, sp_chunk=4, sp_tokens=8)  # fmt: skip
-    out = glm5_next._mixer(layer, whole[shard], ctx)
+                                shard=slice(0, 4), sp_chunk=4, sp_tokens=8, tp=1)  # fmt: skip
+    with torch.no_grad():
+        out = glm5_next._mixer(layer, whole[shard], ctx)
     assert seen["tokens"] == 8
-    assert torch.equal(out, whole[shard] * 10)
-    assert torch.equal(ctx.replay[id(layer)]["topk"], torch.arange(16).reshape(8, 2)[shard])
+    assert torch.equal(out, whole[:4] * 10)
+    assert torch.equal(ctx.replay[id(layer)]["topk"], torch.arange(16).reshape(8, 2)[:4])
+
+
+def test_sequence_parallel_ranks_split_the_tensor_parallel_work_and_every_owner_gets_each_partial_once():
+    from arctic_platform.model.implementations.vllm_aligned.glm5_next import _sp_tp_split
+
+    for sp, tp, per_rank in ((4, 8, 2), (8, 8, 1), (16, 8, 1), (2, 1, 1), (3, 8, 8)):
+        owned, source = _sp_tp_split(sp, tp)
+        assert all(len(owned(s)) == per_rank for s in range(sp))
+        for owner in range(sp):
+            for r in range(tp):
+                assert r in owned(source(r, owner)), (sp, tp, owner, r)
+        # Ranks computing the same TP rank split its owners evenly.
+        if sp > tp:
+            loads = [sum(source(owned(s)[0], o) == s for o in range(sp)) for s in range(sp)]
+            assert len(set(loads)) == 1

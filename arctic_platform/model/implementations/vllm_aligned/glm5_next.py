@@ -367,9 +367,14 @@ def kda_forward(attn: Any, x: torch.Tensor, cu_seqlens: torch.Tensor, config: An
     ``o_proj`` partials are all-reduced (:func:`tp_sum`). ``layout`` (:func:`_kda_steps_layout`) replaces the
     single-turn rule with a turn plan's spans.
     """
-    partials = [_kda_rank(_kda_weights(attn, tp, rank), x, cu_seqlens, config, prompt_lens,
-                          trace if rank == 0 else None, prefill_chunk, layout) for rank in range(tp)]  # fmt: skip
-    return tp_sum(partials)
+    return tp_sum(kda_partials(attn, x, cu_seqlens, config, prompt_lens, trace, tp, prefill_chunk, layout, range(tp)))
+
+
+def kda_partials(attn: Any, x: torch.Tensor, cu_seqlens: torch.Tensor, config: Any, prompt_lens: torch.Tensor | None,
+                 trace: dict | None, tp: int, prefill_chunk: int, layout: Any, ranks) -> list[torch.Tensor]:  # fmt: skip
+    """The ``o_proj`` partials of tensor-parallel ranks ``ranks`` (:func:`kda_forward` before its all-reduce)."""
+    return [_kda_rank(_kda_weights(attn, tp, rank), x, cu_seqlens, config, prompt_lens, trace if rank == 0 else None,
+                      prefill_chunk, layout) for rank in ranks]  # fmt: skip
 
 
 def _kda_step(pieces: list[tuple[int, int, int]], *, decode: bool, resumed: set, device: torch.device) -> Any:
@@ -705,6 +710,13 @@ def lora_linear(x: torch.Tensor, module: Any, weight: torch.Tensor | None = None
 def mla_attention(attn: Any, x: torch.Tensor, positions: torch.Tensor, cu_seqlens: torch.Tensor,
                   config: Any, record: dict | None = None, tp: int = 1,
                   keys: tuple[torch.Tensor, torch.Tensor] | None = None) -> torch.Tensor:  # fmt: skip
+    """:func:`mla_partials` of every tensor-parallel rank, all-reduced as vLLM reduces them (:func:`tp_sum`)."""
+    return tp_sum(mla_partials(attn, x, positions, cu_seqlens, config, record, tp, keys, range(tp)))
+
+
+def mla_partials(attn: Any, x: torch.Tensor, positions: torch.Tensor, cu_seqlens: torch.Tensor,
+                 config: Any, record: dict | None, tp: int, keys: tuple[torch.Tensor, torch.Tensor] | None,
+                 ranks) -> list[torch.Tensor]:  # fmt: skip
     """vLLM's ``Glm5NextMLAAttention`` (sparse MLA with ``mla_use_nope``) on packed requests.
 
     Each token attends to the rows :func:`indexer_topk` selects (every earlier token below ``index_topk``, the
@@ -717,10 +729,10 @@ def mla_attention(attn: Any, x: torch.Tensor, positions: torch.Tensor, cu_seqlen
     up-projection by ``W_UV`` and ``o_proj``. A LoRA adapter on ``q_a``/``kv_a``/``q_b``/``o`` adds its delta with
     vLLM's kernels (:func:`add_lora`).
 
-    At ``tp`` > 1 the replicated ``[q_a; kv_a]``, norms and indexer run once; each tensor-parallel rank then runs its
-    heads (its rows of ``q_b_proj`` and ``kv_b_proj``, its input columns of ``o_proj``), and the ranks' ``o_proj``
-    partials are all-reduced (:func:`tp_sum`). ``keys`` maps each request's key positions to packed tokens
-    (:func:`indexer_topk`).
+    At ``tp`` > 1 the replicated ``[q_a; kv_a]``, norms and indexer run once; each tensor-parallel rank of ``ranks``
+    then runs its heads (its rows of ``q_b_proj`` and ``kv_b_proj``, its input columns of ``o_proj``) into its
+    ``o_proj`` partial (:func:`mla_attention` all-reduces them). ``keys`` maps each request's key positions to packed
+    tokens (:func:`indexer_topk`).
     """
     if not getattr(config, "mla_use_nope", True) and config.qk_rope_head_dim:
         raise NotImplementedError("vLLM-aligned sparse MLA covers mla_use_nope (no rotary embedding)")
@@ -760,7 +772,7 @@ def mla_attention(attn: Any, x: torch.Tensor, positions: torch.Tensor, cu_seqlen
     o, o_lora = bf16_weight(attn.o_proj), lora_factors(attn.o_proj)
     heads_r = heads // tp
     partials = []
-    for rank in range(tp):
+    for rank in ranks:
         q_b_r = tp_shard(q_b, tp, rank)
         q = add_lora(_linear(q_c, q_b_r), q_c, [_column_lora(q_b_lora, tp, rank)], (q_b_r.shape[0],))
         q = q.view(tokens, heads_r, nope + rope)
@@ -777,7 +789,7 @@ def mla_attention(attn: Any, x: torch.Tensor, positions: torch.Tensor, cu_seqlen
         up = up.view(tokens, heads_r * value)
         o_r = tp_shard(o, tp, rank, 1).contiguous()
         partials.append(add_lora(_linear(up, o_r), up, [_row_lora(o_lora, tp, rank)], (o_r.shape[0],)))
-    return tp_sum(partials)
+    return partials
 
 
 def _q_kv_norm_kernel(q: torch.Tensor, kv: torch.Tensor, q_weight: torch.Tensor, kv_weight: torch.Tensor, *,
@@ -846,35 +858,100 @@ def _cu_from_positions(positions: torch.Tensor) -> torch.Tensor:
     return torch.cat([starts, starts.new_tensor([pos.numel()])]).to(torch.int32)
 
 
+def _sp_tp_split(sp: int, tp: int) -> tuple[Callable[[int], list[int]], Callable[[int, int], int]]:
+    """How sequence-parallel ranks share a mixer's tensor-parallel work: ``owned(s)``, the sampler TP ranks whose
+    partials SP rank ``s`` computes (over the whole sequence), and ``source(r, o)``, the SP rank that hands TP rank
+    ``r``'s partial to the owner of token shard ``o``. With ``sp`` dividing ``tp`` each SP rank computes ``tp / sp``
+    ranks; with ``tp`` dividing ``sp`` each TP rank is computed by ``sp / tp`` SP ranks, which split the owners;
+    otherwise every SP rank computes every rank."""
+    if sp <= tp and tp % sp == 0:
+        per = tp // sp
+        return (lambda s: list(range(s * per, (s + 1) * per))), (lambda r, o: r // per)
+    if sp > tp and sp % tp == 0:
+        copies = sp // tp
+        return (lambda s: [s // copies]), (lambda r, o: r * copies + o % copies)
+    return (lambda s: list(range(tp))), (lambda r, o: o)
+
+
+class _AllToAllRows(torch.autograd.Function):
+    """``all_to_all_single`` of ``[rows, ...]`` blocks with ``send_rows[i]`` rows to rank ``i`` and ``recv_rows[i]``
+    from it; the backward sends each gradient row back the way it came."""
+
+    @staticmethod
+    def forward(ctx, group, flat: torch.Tensor, send_rows: list[int], recv_rows: list[int]) -> torch.Tensor:
+        ctx.group, ctx.send_rows, ctx.recv_rows = group, send_rows, recv_rows
+        out = flat.new_empty((sum(recv_rows), *flat.shape[1:]))
+        torch.distributed.all_to_all_single(out, flat.contiguous(), recv_rows, send_rows, group=group)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor):
+        out = grad.new_empty((sum(ctx.send_rows), *grad.shape[1:]))
+        torch.distributed.all_to_all_single(out, grad.contiguous(), ctx.send_rows, ctx.recv_rows, group=ctx.group)
+        return None, out, None, None
+
+
+def _route_partials(group: Any, partials: dict[int, torch.Tensor], source: Callable[[int, int], int], tp: int,
+                    chunk: int, shard: slice) -> torch.Tensor:
+    """Each token shard's owner receives every TP rank's partial rows for its tokens (one all-to-all) and adds them
+    as vLLM's all-reduce does (:func:`tp_sum`, rank order): the owner's rows of the all-reduced mixer output."""
+    size, me = torch.distributed.get_world_size(group), torch.distributed.get_rank(group)
+    sample = next(iter(partials.values()))
+    padded = {r: torch.nn.functional.pad(p, [0, 0, 0, chunk * size - p.shape[0]]) for r, p in partials.items()}
+    send, send_rows = [], []
+    for owner in range(size):
+        ranks = [r for r in sorted(padded) if source(r, owner) == me]
+        send += [padded[r][owner * chunk : (owner + 1) * chunk] for r in ranks]
+        send_rows.append(len(ranks) * chunk)
+    senders = [[r for r in range(tp) if source(r, me) == s] for s in range(size)]
+    recv_rows = [len(ranks) * chunk for ranks in senders]
+    flat = torch.cat(send) if send else sample.new_empty((0, sample.shape[-1]))
+    received = _AllToAllRows.apply(group, flat, send_rows, recv_rows)
+    pieces, offset = {}, 0
+    for ranks in senders:
+        for r in ranks:
+            pieces[r] = received[offset : offset + chunk]
+            offset += chunk
+    return tp_sum([pieces[r] for r in range(tp)])[: shard.stop - shard.start]
+
+
 def _sequence_parallel_mixer(layer: Any, x: torch.Tensor, ctx: Any) -> torch.Tensor:
-    """The mixer of a sequence-parallel rank's token shard: the layer input gathered from every rank, the mixer on
-    the whole packed sequence (the same call as without sequence parallelism, so the same bits), the shard's rows
-    of its output. The sparse top-k rows the backward's stock recompute replays are the shard's queries' (global
-    key indices, as the stock context-parallel attention reads them). Differentiated (the per-op backward), each
-    rank backpropagates its rows of the output through the whole mixer and the gather sums the ranks' gradients."""
+    """The mixer of a sequence-parallel rank's token shard. The layer input is gathered from every rank; the rank
+    computes the ``o_proj`` partials of its share of the sampler's tensor-parallel ranks (:func:`_sp_tp_split`) over
+    the whole packed sequence, the same calls as without sequence parallelism; one all-to-all hands each shard's
+    owner every rank's partial rows, which it adds in rank order, so the output has the same bits. The sparse top-k
+    rows the backward's stock recompute replays are the shard's queries' (global key indices, as the stock
+    context-parallel attention reads them). Differentiated (the per-op backward), the gather and the all-to-all
+    carry the gradients back to the ranks that computed each part."""
     import types
 
+    group = ctx.sp_group
+    owned, source = _sp_tp_split(torch.distributed.get_world_size(group), getattr(ctx, "tp", 1))
+    mine = owned(torch.distributed.get_rank(group))
     record = _record(ctx, layer)
     whole = types.SimpleNamespace(**{**vars(ctx), "sp_group": None, "replay": None if record is None else {}})
-    out = _mixer(layer, _gather_rows(ctx.sp_group, x, ctx.sp_chunk, ctx.sp_tokens), whole)
+    partials = _mixer_partials(layer, _gather_rows(group, x, ctx.sp_chunk, ctx.sp_tokens), whole, mine)
     if record is not None:
         rows = whole.replay.get(id(layer), {}).get("topk")
         if rows is not None:
             record["topk"] = rows[ctx.shard]
-    return out[ctx.shard]
+    return _route_partials(group, dict(zip(mine, partials)), source, getattr(ctx, "tp", 1), ctx.sp_chunk, ctx.shard)
+
+
+def _mixer_partials(layer: Any, x: torch.Tensor, ctx: Any, ranks) -> list[torch.Tensor]:
+    """The mixer's ``o_proj`` partials of the sampler's tensor-parallel ranks ``ranks``, before the all-reduce."""
+    tp, turns = getattr(ctx, "tp", 1), getattr(ctx, "turns", None)
+    if layer.block_type == "linear_attention":
+        return kda_partials(layer.self_attn, x, ctx.cu_seqlens, ctx.config, getattr(ctx, "prompt_lens", None), None,
+                            tp, getattr(ctx, "prefill_chunk", 0), turns and turns.kda, ranks)  # fmt: skip
+    return mla_partials(layer.self_attn, x, ctx.positions, ctx.cu_seqlens, ctx.config, _record(ctx, layer), tp,
+                        turns and (turns.key_index, turns.key_cu), ranks)  # fmt: skip
 
 
 def _mixer(layer: Any, x: torch.Tensor, ctx: Any) -> torch.Tensor:
     if getattr(ctx, "sp_group", None) is not None:
         return _sequence_parallel_mixer(layer, x, ctx)
-    prompt_lens = getattr(ctx, "prompt_lens", None)
-    tp = getattr(ctx, "tp", 1)
-    turns = getattr(ctx, "turns", None)
-    if layer.block_type == "linear_attention":
-        return kda_forward(layer.self_attn, x, ctx.cu_seqlens, ctx.config, prompt_lens, tp=tp,
-                           prefill_chunk=getattr(ctx, "prefill_chunk", 0), layout=turns and turns.kda)
-    return mla_attention(layer.self_attn, x, ctx.positions, ctx.cu_seqlens, ctx.config, _record(ctx, layer), tp=tp,
-                         keys=turns and (turns.key_index, turns.key_cu))
+    return tp_sum(_mixer_partials(layer, x, ctx, range(getattr(ctx, "tp", 1))))
 
 
 def fp8_block_linear(x: torch.Tensor, weight: torch.Tensor, weight_scale_inv: torch.Tensor) -> torch.Tensor:
