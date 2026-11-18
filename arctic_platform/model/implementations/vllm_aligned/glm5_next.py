@@ -49,6 +49,7 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import functools
+import os
 from typing import Any
 from typing import Callable
 
@@ -57,6 +58,8 @@ import torch
 from arctic_platform.model.implementations.vllm_aligned import ops
 
 FP8_BLOCK = 128  # block-FP8 weight block (rows and columns)
+# "0": run the KDA ops before o_proj once per emulated TP rank instead of once over all of them (same bits).
+TP_BATCH_ENV = "ARCTIC_VLLM_ALIGNED_TP_BATCH"
 
 # Set while a layer's backward recomputes the aligned forward with every kernel call differentiable (``vllm_op``).
 _DIFFERENTIABLE = contextvars.ContextVar("vllm_aligned_differentiable", default=False)
@@ -373,8 +376,42 @@ def kda_forward(attn: Any, x: torch.Tensor, cu_seqlens: torch.Tensor, config: An
 def kda_partials(attn: Any, x: torch.Tensor, cu_seqlens: torch.Tensor, config: Any, prompt_lens: torch.Tensor | None,
                  trace: dict | None, tp: int, prefill_chunk: int, layout: Any, ranks) -> list[torch.Tensor]:  # fmt: skip
     """The ``o_proj`` partials of tensor-parallel ranks ``ranks`` (:func:`kda_forward` before its all-reduce)."""
+    ranks = list(ranks)
+    if trace is None and len(ranks) > 1 and os.environ.get(TP_BATCH_ENV, "1") != "0":
+        return _kda_ranks([_kda_weights(attn, tp, rank) for rank in ranks], x, cu_seqlens, config, prompt_lens,
+                          prefill_chunk, layout)  # fmt: skip
     return [_kda_rank(_kda_weights(attn, tp, rank), x, cu_seqlens, config, prompt_lens, trace if rank == 0 else None,
                       prefill_chunk, layout) for rank in ranks]  # fmt: skip
+
+
+def _kda_ranks(ws: list, x: torch.Tensor, cu_seqlens: torch.Tensor, config: Any, prompt_lens: torch.Tensor | None,
+               prefill_chunk: int = 0, layout: Any = None) -> list[torch.Tensor]:  # fmt: skip
+    """:func:`_kda_rank`'s ``o_proj`` partials of several ranks: every op before ``o_proj`` is column- or
+    head-parallel and runs once over all the ranks' columns or heads, which gives each rank the bits of its own
+    call; ``o_proj`` (row-parallel, its partials summed in rank order) runs per rank."""
+    n, heads, head_dim = len(ws), ws[0].heads, ws[0].head_dim
+    projection = heads * head_dim
+    tokens = x.shape[0]
+    if layout is None:
+        lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).long()
+        prompt_lens = lengths if prompt_lens is None else prompt_lens.long()
+        if prefill_chunk > 0:
+            prompt_lens = prompt_lens - ((prompt_lens > 1) & (prompt_lens % prefill_chunk == 1)).long()
+        layout = _single_turn_kda_layout(cu_seqlens, prompt_lens, prefill_chunk, x.device)
+    rows = [w.merged[: 3 * projection] for w in ws] + [w.merged[3 * projection : 3 * projection + heads] for w in ws]
+    projected = _linear(x, torch.cat([*rows, ws[0].merged[3 * projection + heads :]]))
+    qkv, beta, f_a, g_a = projected.split([3 * projection * n, heads * n, head_dim, head_dim], dim=-1)
+    g1 = _linear(f_a, torch.cat([w.f_b for w in ws])).reshape(1, tokens, heads * n, head_dim)
+    g2 = _linear(g_a, torch.cat([w.g_b for w in ws])).reshape(tokens, heads * n, head_dim)
+    conv = _op(_kda_conv_kernel, "ref_causal_conv_silu", qkv, torch.cat([w.conv for w in ws]), layout=layout,
+               trace=None, cu_seqlens=cu_seqlens)  # fmt: skip
+    q, k, v = (t.reshape(1, tokens, heads * n, head_dim) for t in conv.view(tokens, n, 3, projection).unbind(2))
+    core = _op(_kda_core_kernel, "ref_kda_core", q, k, v, g1, beta, torch.cat([w.a_log for w in ws]),
+               torch.cat([w.dt_bias for w in ws]), layout=layout, lower_bound=config.linear_lower_bound, trace=None,
+               cu_seqlens=cu_seqlens)  # fmt: skip
+    core = _op(_gated_norm_kernel, "ref_gated_rms_norm", core, g2, ws[0].o_norm, eps=KDA_O_NORM_EPS)
+    return [add_lora(_linear(c.reshape(tokens, -1), w.o_weight), c.reshape(tokens, -1), [w.o_lora],
+                     (w.o_weight.shape[0],)) for c, w in zip(core.split(heads, dim=2), ws)]  # fmt: skip
 
 
 def _kda_step(pieces: list[tuple[int, int, int]], *, decode: bool, resumed: set, device: torch.device) -> Any:
@@ -783,10 +820,10 @@ def mla_partials(attn: Any, x: torch.Tensor, positions: torch.Tensor, cu_seqlens
         k_cache = kv_rows[:, latent:].unsqueeze(1).unsqueeze(1)
     else:  # FA3's QV path needs a 64-wide Q/K: a zero query against the first 64 latent columns
         k_cache = v_cache[..., :64]
-    # One op for every rank: each rank's head slice runs the sampler's kernel; the reference takes all the heads at
-    # once (FlashMLA pads a call's heads to 64, so per-rank calls of a few heads each would each pay for 64).
-    outs = _op(_sparse_mla_ranks_kernel, "ref_sparse_mla", torch.cat(q_ropes, 1), k_cache, v_cache,
-               torch.cat(q_latents, 1), rows, valid, softmax_scale=(nope + rope) ** -0.5, heads_r=heads_r)  # fmt: skip
+    # One call over every rank's heads: FA3 gives each head the bits of the rank's own call (heads are independent),
+    # and the reference's FlashMLA pads a call's heads to 64, so per-rank calls of a few heads would each pay for 64.
+    outs = _op(_sparse_mla_kernel, "ref_sparse_mla", torch.cat(q_ropes, 1), k_cache, v_cache, torch.cat(q_latents, 1),
+               rows, valid, softmax_scale=(nope + rope) ** -0.5)  # fmt: skip
     partials = []
     for i, rank in enumerate(ranks):
         out = outs[:, i * heads_r : (i + 1) * heads_r].contiguous()
@@ -830,15 +867,6 @@ def _sparse_mla_kernel(q_rope, k_cache, v_cache, q_v, rows, valid, *, softmax_sc
         causal=True,
         fa_version=3,
     )
-
-
-def _sparse_mla_ranks_kernel(q_rope, k_cache, v_cache, q_v, rows, valid, *, softmax_scale: float, heads_r: int,
-                             **_) -> torch.Tensor:  # fmt: skip
-    """:func:`_sparse_mla_kernel` on each ``heads_r``-head slice of ``q_rope``/``q_v`` (an emulated TP rank's heads,
-    contiguous as the sampler's rank holds them), the outputs concatenated over heads."""
-    return torch.cat([_sparse_mla_kernel(qr.contiguous(), k_cache, v_cache, qv.contiguous(), rows, valid,
-                                         softmax_scale=softmax_scale)
-                      for qr, qv in zip(q_rope.split(heads_r, 1), q_v.split(heads_r, 1))], dim=1)  # fmt: skip
 
 
 def _gather_tokens(group: Any, x: torch.Tensor, dim: int = 0) -> torch.Tensor:
