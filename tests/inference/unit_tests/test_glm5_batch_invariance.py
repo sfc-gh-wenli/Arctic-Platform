@@ -254,8 +254,10 @@ def test_block_fp8_moe_takes_one_fixed_config_at_every_batch_size(monkeypatch):
     configs = [fused_moe.get_default_config(m, 256, 512, 4096, 8, "fp8_w8a8", [128, 128]) for m in (1, 37, 4096)]
     assert configs == [glm5_batch_invariance.FP8_BLOCK_MOE_CONFIG] * 3
     assert configs[0] is not glm5_batch_invariance.FP8_BLOCK_MOE_CONFIG
-    assert fused_moe.get_default_config(7, 256, 512, 4096, 8, None) == {"BLOCK_SIZE_M": 7}
+    bf16 = [fused_moe.get_default_config(m, 256, 512, 4096, 8, None) for m in (1, 37, 4096)]
+    assert bf16 == [glm5_batch_invariance.BF16_MOE_CONFIG] * 3
     assert fused_moe.get_default_config(7, 256, 512, 4096, 8, "fp8_w8a8", None) == {"BLOCK_SIZE_M": 7}
+    assert fused_moe.get_default_config(7, 256, 512, 4096, 8, "int8_w8a16", None) == {"BLOCK_SIZE_M": 7}
 
 
 def test_prefill_chunks_end_at_whole_kpools(monkeypatch):

@@ -429,10 +429,15 @@ def _batch_invariant_router_gate() -> None:
 # at TP 1, 1.7x at TP 4). BLOCK_SIZE_K and BLOCK_SIZE_M change the bits; BLOCK_SIZE_N, the warps and stages do not.
 FP8_BLOCK_MOE_CONFIG = {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128, "GROUP_SIZE_M": 1,
                         "SPLIT_K": 1, "num_warps": 4, "num_stages": 4}  # fmt: skip
+# With bf16 experts on H200, every tile config tried (BLOCK_SIZE_K 32 to 128) gave the generic config's bits, so this
+# one is chosen for speed: ~20% faster per call than the generic config at GLM-5.3-Flash-BF16's TP 8 expert shard.
+BF16_MOE_CONFIG = {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64, "GROUP_SIZE_M": 1, "SPLIT_K": 1,
+                   "num_warps": 4, "num_stages": 3}  # fmt: skip
 
 
 def _fixed_fp8_block_moe_config() -> None:
-    """Run the block-FP8 fused MoE kernel with :data:`FP8_BLOCK_MOE_CONFIG` at every batch size.
+    """Run the block-FP8 fused MoE kernel with :data:`FP8_BLOCK_MOE_CONFIG`, and the bf16 one with
+    :data:`BF16_MOE_CONFIG`, at every batch size.
 
     vLLM's batch-invariant mode replaces the tuned configs with one generic config (BLOCK_SIZE_K 32), which with
     128 x 128 weight blocks scales and accumulates four partial products per block.
@@ -444,6 +449,8 @@ def _fixed_fp8_block_moe_config() -> None:
     def get_default_config(M, E, N, K, topk, dtype, block_shape=None):
         if dtype == "fp8_w8a8" and block_shape is not None and list(block_shape) == [128, 128]:
             return dict(FP8_BLOCK_MOE_CONFIG)
+        if dtype is None and block_shape is None:
+            return dict(BF16_MOE_CONFIG)
         return original(M, E, N, K, topk, dtype, block_shape)
 
     fused_moe.get_default_config = get_default_config
@@ -568,6 +575,10 @@ SKIP_ENV_VAR = "ARCTIC_GLM5_BI_SKIP"
 PATCHES = ("gdn", "one_split", "mhc_split", "mhc_unfused", "router_gate", "mla_mqa", "fp8_linear", "kda_mixed",
            "indexer_topk", "causal_rows", "indexer_knorm", "indexer_weights", "grouped_topk", "kda_pin",
            "moe_config", "kpool_chunks", "kda_checkpoints", "tp_allreduce", "kda_decode_strides")  # fmt: skip
+# Patches applied only when their variable is "1". Without tp_allreduce, GLM-5.3-Flash-BF16 at TP 8 gives the same
+# bits on every token (16,377 decoded over 64 batched rows, batch-invariant alone vs. batched) and generates 2.9x
+# faster.
+OPT_IN = {"tp_allreduce": "ARCTIC_GLM5_TP_ALLREDUCE"}
 
 
 def _load_proxy_layers_only(num_layers: int) -> None:
@@ -636,6 +647,8 @@ def ensure_glm5_batch_invariance() -> None:
                         ("moe_config", _fixed_fp8_block_moe_config), ("kpool_chunks", _kpool_aligned_chunks),
                         ("kda_checkpoints", _no_kda_prefill_checkpoints), ("tp_allreduce", _fixed_order_tp_all_reduce),
                         ("kda_decode_strides", _contiguous_kda_decode_inputs)):  # fmt: skip
+        if name in OPT_IN and os.environ.get(OPT_IN[name], "0") != "1":
+            continue
         if name not in skip:
             apply()
     if "grouped_topk" not in skip:
