@@ -535,6 +535,25 @@ def _fixed_order_tp_all_reduce() -> None:
     CudaCommunicator.all_reduce = all_reduce
 
 
+RELAXED_NCCL_PINS = ("NCCL_NTHREADS", "NCCL_SOCKET_NTHREADS", "NCCL_MIN_NCHANNELS", "NCCL_MAX_NCHANNELS", "NCCL_PROTO")
+
+
+def _relaxed_nccl_pins() -> None:
+    """Leave NCCL's thread, channel and protocol settings at NCCL's defaults in batch-invariant mode.
+
+    vLLM pins one channel, one thread and the Simple protocol for every NCCL collective. With NVLink, batch-invariant
+    mode sends every floating-point tensor-parallel all-reduce through the custom all-reduce, so the NCCL calls left
+    at TP (all-gathers) move data without arithmetic and keep their bits under any of these settings."""
+    from vllm.model_executor.determinism import batch_invariant
+
+    original = batch_invariant.pin_nccl_env
+
+    def pin_nccl_env(pins):
+        return original({name: value for name, value in pins.items() if name not in RELAXED_NCCL_PINS})
+
+    batch_invariant.pin_nccl_env = pin_nccl_env
+
+
 def _contiguous_kda_decode_inputs() -> None:
     """Give the decode step's ``fused_recurrent_kda`` contiguous q/k/v.
 
@@ -574,11 +593,12 @@ PROXY_ENV_VAR = "ARCTIC_GLM5_PROXY_LAYERS"
 SKIP_ENV_VAR = "ARCTIC_GLM5_BI_SKIP"
 PATCHES = ("gdn", "one_split", "mhc_split", "mhc_unfused", "router_gate", "mla_mqa", "fp8_linear", "kda_mixed",
            "indexer_topk", "causal_rows", "indexer_knorm", "indexer_weights", "grouped_topk", "kda_pin",
-           "moe_config", "kpool_chunks", "kda_checkpoints", "tp_allreduce", "kda_decode_strides")  # fmt: skip
+           "moe_config", "kpool_chunks", "kda_checkpoints", "tp_allreduce", "kda_decode_strides",
+           "nccl_relax")  # fmt: skip
 # Patches applied only when their variable is "1". Without tp_allreduce, GLM-5.3-Flash-BF16 at TP 8 gives the same
 # bits on every token (16,377 decoded over 64 batched rows, batch-invariant alone vs. batched) and generates 2.9x
 # faster.
-OPT_IN = {"tp_allreduce": "ARCTIC_GLM5_TP_ALLREDUCE"}
+OPT_IN = {"tp_allreduce": "ARCTIC_GLM5_TP_ALLREDUCE", "nccl_relax": "ARCTIC_GLM5_NCCL_RELAX"}
 
 
 def _load_proxy_layers_only(num_layers: int) -> None:
@@ -646,7 +666,7 @@ def ensure_glm5_batch_invariance() -> None:
                         ("indexer_weights", _batch_invariant_indexer_head_weights),
                         ("moe_config", _fixed_fp8_block_moe_config), ("kpool_chunks", _kpool_aligned_chunks),
                         ("kda_checkpoints", _no_kda_prefill_checkpoints), ("tp_allreduce", _fixed_order_tp_all_reduce),
-                        ("kda_decode_strides", _contiguous_kda_decode_inputs)):  # fmt: skip
+                        ("kda_decode_strides", _contiguous_kda_decode_inputs), ("nccl_relax", _relaxed_nccl_pins)):  # fmt: skip
         if name in OPT_IN and os.environ.get(OPT_IN[name], "0") != "1":
             continue
         if name not in skip:
