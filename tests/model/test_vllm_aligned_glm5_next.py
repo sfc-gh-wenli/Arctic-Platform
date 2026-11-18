@@ -911,6 +911,24 @@ def test_sequence_parallel_ranks_sharing_a_tensor_parallel_rank_split_kda_at_req
     assert torch.equal(out, whole[5:] * 10)
 
 
+def test_sp_ranks_split_kda_only_if_each_gets_requests_and_mla_only_if_each_gets_queries():
+    import types
+
+    from arctic_platform.model.implementations.vllm_aligned.glm5_next import _sp_spans
+
+    def spans(cu, tokens, kda):
+        ctx = types.SimpleNamespace(tp=1, sp_chunk=-(-tokens // 2), sp_tokens=tokens, sp_cache={}, turns=None,
+                                    cu_seqlens=torch.tensor(cu, dtype=torch.int32))  # fmt: skip
+        spans_of, restrict = _sp_spans(ctx, 2, kda)
+        return [spans_of(s) for s in range(2)], restrict
+
+    assert spans([0, 2, 7, 10], 10, kda=True) == ([[(0, 7)], [(7, 10)]], True)
+    # One request: no boundary to cut at. Each rank keeps its owner's rows (the run covers the whole request).
+    assert spans([0, 10], 10, kda=True) == ([[(0, 5)], [(5, 10)]], True)
+    # One token: rank 1 would compute nothing, so both compute everything.
+    assert spans([0, 1], 1, kda=False) == ([[(0, 1)], []], False)
+
+
 def test_a_turn_plan_rows_kda_replay_cut_out_of_the_batch_is_the_rows_own():
     import types
 

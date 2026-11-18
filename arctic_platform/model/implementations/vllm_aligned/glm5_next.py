@@ -1048,22 +1048,28 @@ def _sp_unit_bounds(ctx: Any) -> list[int]:
     return cache["units"]
 
 
-def _sp_spans(ctx: Any, size: int, kda: bool) -> Callable[[int], list[tuple[int, int]]]:
-    """The packed-token intervals at which each sequence-parallel rank computes its TP ranks' mixer partials
+def _sp_spans(ctx: Any, size: int, kda: bool) -> tuple[Callable[[int], list[tuple[int, int]]], bool]:
+    """The packed-token intervals at which each sequence-parallel rank holds its TP ranks' mixer partials
     (:func:`_route_partials`): the shards of the owners it hands them to (:func:`_sp_tp_split`). Where several SP ranks
     compute one TP rank KDA instead cuts the sequence between them at the request (turn-plan row) boundaries nearest
-    even shares, so that each runs the recurrences of its own requests."""
+    even shares, so that each runs the recurrences of its own requests.
+
+    Also whether each rank may compute its partials there alone: only if every rank has tokens. In the per-op
+    backward a rank that computed nothing would give its mixer's parameters no gradient, while the other ranks reduce
+    theirs (ZeRO's gradient hooks would no longer pair up); every rank then computes every token, as without the
+    split, and keeps its intervals' rows."""
     key = ("spans", kda)
     if key not in ctx.sp_cache:
         tp, chunk, tokens = getattr(ctx, "tp", 1), ctx.sp_chunk, ctx.sp_tokens
         owned, source = _sp_tp_split(size, tp)
-        if kda and size > tp and size % tp == 0 and os.environ.get(SP_QUERIES_ENV, "1") != "0":
+        table = None
+        if kda and size > tp and size % tp == 0:
             copies, bounds = size // tp, _sp_unit_bounds(ctx)
             cuts = [0] + [min(bounds, key=lambda b: abs(b - tokens * c / copies)) for c in range(1, copies)] + [tokens]
             cuts = [max(cuts[: i + 1]) for i in range(len(cuts))]
-            table = [[(cuts[s % copies], cuts[s % copies + 1])] if cuts[s % copies] < cuts[s % copies + 1] else []
-                     for s in range(size)]  # fmt: skip
-        else:
+            if all(lo < hi for lo, hi in zip(cuts[:-1], cuts[1:])):
+                table = [[(cuts[s % copies], cuts[s % copies + 1])] for s in range(size)]
+        if table is None:
             table = []
             for s in range(size):
                 spans: list[list[int]] = []
@@ -1076,8 +1082,9 @@ def _sp_spans(ctx: Any, size: int, kda: bool) -> Callable[[int], list[tuple[int,
                     else:
                         spans.append([lo, hi])
                 table.append([tuple(span) for span in spans])
-        ctx.sp_cache[key] = table
-    return ctx.sp_cache[key].__getitem__
+        restrict = all(table) and os.environ.get(SP_QUERIES_ENV, "1") != "0"
+        ctx.sp_cache[key] = (table.__getitem__, restrict)
+    return ctx.sp_cache[key]
 
 
 def _sequence_parallel_mixer(layer: Any, x: torch.Tensor, ctx: Any) -> torch.Tensor:
@@ -1096,13 +1103,13 @@ def _sequence_parallel_mixer(layer: Any, x: torch.Tensor, ctx: Any) -> torch.Ten
     mine = owned(me)
     if getattr(ctx, "sp_cache", None) is None:
         ctx.sp_cache = {}
-    spans_of = _sp_spans(ctx, size, layer.block_type == "linear_attention")
+    spans_of, restrict = _sp_spans(ctx, size, layer.block_type == "linear_attention")
     record = _record(ctx, layer)
     whole = types.SimpleNamespace(**{**vars(ctx), "sp_group": None, "replay": None if record is None else {}})
     with _phase("sp.gather"):
         x = _gather_rows(group, x, ctx.sp_chunk, ctx.sp_tokens)
     with _phase(f"sp.partials.{layer.block_type}"):
-        partials = _mixer_partials(layer, x, whole, mine, spans_of(me))
+        partials = _mixer_partials(layer, x, whole, mine, spans_of(me), restrict)
     if record is not None:
         rows = whole.replay.get(id(layer), {}).get("topk")
         if rows is not None:
@@ -1113,18 +1120,19 @@ def _sequence_parallel_mixer(layer: Any, x: torch.Tensor, ctx: Any) -> torch.Ten
         return _route_partials(group, dict(zip(mine, partials)), owned, spans_of, tp, ctx.sp_chunk, ctx.shard)
 
 
-def _mixer_partials(layer: Any, x: torch.Tensor, ctx: Any, ranks,
-                    spans: list[tuple[int, int]] | None = None) -> list[torch.Tensor]:  # fmt: skip
+def _mixer_partials(layer: Any, x: torch.Tensor, ctx: Any, ranks, spans: list[tuple[int, int]] | None = None,
+                    restrict: bool = False) -> list[torch.Tensor]:  # fmt: skip
     """The mixer's ``o_proj`` partials of the sampler's tensor-parallel ranks ``ranks``, before the all-reduce, at the
-    packed tokens ``spans`` (sorted intervals, their rows concatenated; every token by default). MLA runs its queries
-    there; KDA runs the requests covering them (:func:`_kda_partials_between`)."""
+    packed tokens ``spans`` (sorted intervals, their rows concatenated; every token by default). With ``restrict``
+    MLA runs only those queries and KDA only the requests covering them (:func:`_kda_partials_between`); otherwise
+    both run every token and keep those rows."""
     tp, turns, tokens = getattr(ctx, "tp", 1), getattr(ctx, "turns", None), x.shape[0]
     if spans == [(0, tokens)]:
         spans = None
-    if spans is not None and not spans:
-        return [x[:0] * 0 for _ in ranks]  # keeps this rank's gather and all-to-all in the backward
-    queries = None if spans is None else torch.cat([torch.arange(a, b) for a, b in spans]).to(x.device)
-    restrict = queries is not None and os.environ.get(SP_QUERIES_ENV, "1") != "0"
+    queries = None
+    if spans is not None:
+        queries = torch.cat([torch.arange(a, b) for a, b in spans] or [torch.zeros(0, dtype=torch.long)]).to(x.device)
+    restrict = restrict and bool(spans)
     if layer.block_type == "linear_attention":
         lo, hi = 0, tokens
         if restrict:
