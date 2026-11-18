@@ -956,3 +956,16 @@ def test_sequence_parallel_ranks_split_the_tensor_parallel_work_and_every_owner_
         if sp > tp:
             loads = [sum(source(owned(s)[0], o) == s for o in range(sp)) for s in range(sp)]
             assert len(set(loads)) == 1
+
+
+def test_the_loader_sets_only_the_aligned_forwards_switches():
+    import pytest
+    from pydantic import ValidationError
+
+    from arctic_platform.model.loaders.flash_moe import Glm5NextOptions
+
+    options = Glm5NextOptions.model_validate({"vllm_aligned": True,
+                                              "vllm_aligned_env": {"ARCTIC_VLLM_ALIGNED_SP_QUERIES": "0"}})  # fmt: skip
+    assert options.vllm_aligned_env == {"ARCTIC_VLLM_ALIGNED_SP_QUERIES": "0"}
+    with pytest.raises(ValidationError, match="ARCTIC_VLLM_ALIGNED_"):
+        Glm5NextOptions.model_validate({"vllm_aligned_env": {"NCCL_ALGO": "Ring"}})

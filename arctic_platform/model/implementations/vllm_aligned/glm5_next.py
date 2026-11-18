@@ -62,6 +62,14 @@ FP8_BLOCK = 128  # block-FP8 weight block (rows and columns)
 TP_BATCH_ENV = "ARCTIC_VLLM_ALIGNED_TP_BATCH"
 # "0": a sequence-parallel rank computes its mixer partials at every token, not only at those it hands them on for.
 SP_QUERIES_ENV = "ARCTIC_VLLM_ALIGNED_SP_QUERIES"
+# "1"/"0": the backward ("vllm") takes the forward's mixer and MoE outputs instead of recomputing them (same values).
+# Default: with sequence parallelism, where a rank keeps only its shard's rows.
+KEEP_OUTPUTS_ENV = "ARCTIC_VLLM_ALIGNED_KEEP_OUTPUTS"
+# "1": time the forward's and backward's phases with CUDA events; rank 0 logs the totals at the next call.
+PROFILE_ENV = "ARCTIC_VLLM_ALIGNED_PROFILE"
+_PHASE_PREFIX = contextvars.ContextVar("vllm_aligned_phase", default="fwd")
+_PHASES: list = []
+_PHASE_TOKENS: list = [0]
 
 # Set while a layer's backward recomputes the aligned forward with every kernel call differentiable (``vllm_op``).
 _DIFFERENTIABLE = contextvars.ContextVar("vllm_aligned_differentiable", default=False)
@@ -76,6 +84,40 @@ def differentiable():
         yield
     finally:
         _DIFFERENTIABLE.reset(token)
+
+
+@contextlib.contextmanager
+def _phase(name: str):
+    """With :data:`PROFILE_ENV`, times the block on the current stream (:func:`_log_phases` reports it)."""
+    if os.environ.get(PROFILE_ENV) != "1":
+        yield
+        return
+    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    start.record()
+    try:
+        yield
+    finally:
+        end.record()
+        _PHASES.append((f"{_PHASE_PREFIX.get()}.{name}", start, end))
+
+
+def _log_phases(tokens: int) -> None:
+    """Rank 0's phase totals (seconds, nested phases counted in their parents too) since the last call, then starts
+    timing a call of ``tokens`` packed tokens."""
+    if _PHASES:
+        import collections
+        import json
+        import logging
+
+        torch.cuda.synchronize()
+        totals: dict = collections.defaultdict(float)
+        for name, start, end in _PHASES:
+            totals[name] += start.elapsed_time(end) / 1000
+        _PHASES.clear()
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            logging.getLogger(__name__).warning("vllm_aligned profile: tokens=%d %s", _PHASE_TOKENS[0],
+                                                json.dumps({k: round(v, 3) for k, v in sorted(totals.items())}))  # fmt: skip
+    _PHASE_TOKENS[0] = tokens
 
 
 def _bind(fn: Callable, static: dict) -> Callable:
@@ -199,12 +241,15 @@ class _AlignedLayer(torch.autograd.Function):
                     deterministic.fill_uninitialized_memory)  # fmt: skip
         torch.use_deterministic_algorithms(True, warn_only=True)
         deterministic.fill_uninitialized_memory = False
+        phase = _PHASE_PREFIX.set("bwd")
         try:
-            with torch.enable_grad():
+            with torch.enable_grad(), _phase("recompute"):
                 replay = streams.detach().requires_grad_(streams.requires_grad)
                 out = ctx.run_stock(replay)
-            torch.autograd.backward(out, grad_out)
+            with _phase("autograd"):
+                torch.autograd.backward(out, grad_out)
         finally:
+            _PHASE_PREFIX.reset(phase)
             torch.use_deterministic_algorithms(previous[0], warn_only=previous[1])
             deterministic.fill_uninitialized_memory = previous[2]
         return (replay.grad if streams.requires_grad else None), None, None
@@ -1054,15 +1099,18 @@ def _sequence_parallel_mixer(layer: Any, x: torch.Tensor, ctx: Any) -> torch.Ten
     spans_of = _sp_spans(ctx, size, layer.block_type == "linear_attention")
     record = _record(ctx, layer)
     whole = types.SimpleNamespace(**{**vars(ctx), "sp_group": None, "replay": None if record is None else {}})
-    x = _gather_rows(group, x, ctx.sp_chunk, ctx.sp_tokens)
-    partials = _mixer_partials(layer, x, whole, mine, spans_of(me))
+    with _phase("sp.gather"):
+        x = _gather_rows(group, x, ctx.sp_chunk, ctx.sp_tokens)
+    with _phase(f"sp.partials.{layer.block_type}"):
+        partials = _mixer_partials(layer, x, whole, mine, spans_of(me))
     if record is not None:
         rows = whole.replay.get(id(layer), {}).get("topk")
         if rows is not None:
             parts = _pieces(spans_of(me), ctx.shard.start, ctx.shard.stop)
             start = parts[0][0] if parts else 0
             record["topk"] = rows[start : start + ctx.shard.stop - ctx.shard.start]
-    return _route_partials(group, dict(zip(mine, partials)), owned, spans_of, tp, ctx.sp_chunk, ctx.shard)
+    with _phase("sp.route"):
+        return _route_partials(group, dict(zip(mine, partials)), owned, spans_of, tp, ctx.sp_chunk, ctx.shard)
 
 
 def _mixer_partials(layer: Any, x: torch.Tensor, ctx: Any, ranks,
@@ -1363,9 +1411,10 @@ def _routed_experts_ranks(x, weights, ids, *, experts: Any, total: int, ep_group
                           limit: float) -> tuple[torch.Tensor, ...]:  # fmt: skip
     """Each tensor-parallel rank's routed-expert output: vLLM's Triton experts on that rank's shard of every expert's
     ``gate``/``up`` rows and ``down`` columns, the experts gathered from every expert-parallel rank."""
-    w1, w2, w3 = (_full(t, total, ep_group) for t in (experts.w1, experts.w2, experts.w3))
-    scales = [getattr(experts, f"{w}_scale_inv", None) for w in ("w1", "w2", "w3")]
-    s1, s2, s3 = (None, None, None) if scales[0] is None else (_full(t, total, ep_group) for t in scales)
+    with _phase("moe.gather_experts"):
+        w1, w2, w3 = (_full(t, total, ep_group) for t in (experts.w1, experts.w2, experts.w3))
+        scales = [getattr(experts, f"{w}_scale_inv", None) for w in ("w1", "w2", "w3")]
+        s1, s2, s3 = (None, None, None) if scales[0] is None else (_full(t, total, ep_group) for t in scales)
     out = []
     for rank in range(tp):
         (w1_r, s1_r), (w3_r, s3_r) = _shard(w1, s1, tp, rank, 1), _shard(w3, s3, tp, rank, 1)
@@ -1426,10 +1475,19 @@ def _record(ctx: Any, layer: Any) -> dict | None:
 
 def aligned_layer(layer: Any, streams: torch.Tensor, config: Any, ctx: Any) -> torch.Tensor:
     """The sampler's computation of one decoder layer on ``[tokens, hc_mult, hidden]`` residual streams."""
-    post, comb, x = hc_pre(streams, layer.attn_hc, layer.input_layernorm, config)
-    streams = hc_post(_mixer(layer, x, ctx), streams, post, comb)
-    post, comb, x = hc_pre(streams, layer.ffn_hc, layer.post_attention_layernorm, config)
-    return hc_post(_mlp(layer, x, ctx), streams, post, comb)
+    with _phase("hc"):
+        post, comb, x = hc_pre(streams, layer.attn_hc, layer.input_layernorm, config)
+    with _phase(f"mixer.{layer.block_type}"):
+        mixed = _mixer(layer, x, ctx)
+    if getattr(ctx, "keep_mixer_out", False) and not _DIFFERENTIABLE.get():
+        _record(ctx, layer)["mixer_out"] = mixed
+    with _phase("hc"):
+        streams = hc_post(mixed, streams, post, comb)
+        post, comb, x = hc_pre(streams, layer.ffn_hc, layer.post_attention_layernorm, config)
+    with _phase("mlp"):
+        out = _mlp(layer, x, ctx)
+    with _phase("hc"):
+        return hc_post(out, streams, post, comb)
 
 
 def aligned_hidden(backbone: Any, input_ids: torch.Tensor, config: Any, ctx: Any, run_stock: Callable) -> torch.Tensor:
@@ -1677,21 +1735,24 @@ def _vllm_backward_runner(input_ids: torch.Tensor, position_ids: torch.Tensor, k
         fused, post, comb, x, exact = pre(layer, layer.attn_hc, layer.input_layernorm, streams)
         with _stock_replay(layer, record, kwargs, vllm_mla_weights=True) as extra:
             if "mixer" in per_op:
-                with differentiable():
+                with differentiable(), _phase(f"per_op.mixer.{layer.block_type}"):
                     mixed = _mixer(layer, x, ctx)
                 mixed_exact = mixed.detach()
             else:
-                with torch.no_grad():
-                    mixed_exact = _mixer(layer, exact[2], ctx)
+                mixed_exact = record.pop("mixer_out", None)  # the forward's (ctx.keep_mixer_out)
+                if mixed_exact is None:
+                    with torch.no_grad(), _phase(f"exact.mixer.{layer.block_type}"):
+                        mixed_exact = _mixer(layer, exact[2], ctx)
                 # The stock layer takes these by name before passing the rest of the packing kwargs down.
-                if layer.block_type == "linear_attention":
-                    mixed = layer.self_attn(**{**layer_kwargs, "hidden_states": x.unsqueeze(0), "cache_params": None,
-                                               "attention_mask": mask})  # fmt: skip
-                else:
-                    mixed = layer.self_attn(**{**layer_kwargs, "hidden_states": x.unsqueeze(0), "attention_mask": mask,
-                                               "position_ids": position_ids.reshape(1, -1), "past_key_values": None,
-                                               "use_cache": False, "position_embeddings": None,
-                                               "prev_topk_indices": None})[0]  # fmt: skip
+                with _phase(f"stock.mixer.{layer.block_type}"):
+                    if layer.block_type == "linear_attention":
+                        mixed = layer.self_attn(**{**layer_kwargs, "hidden_states": x.unsqueeze(0),
+                                                   "cache_params": None, "attention_mask": mask})  # fmt: skip
+                    else:
+                        mixed = layer.self_attn(**{**layer_kwargs, "hidden_states": x.unsqueeze(0),
+                                                   "attention_mask": mask, "position_ids": position_ids.reshape(1, -1),
+                                                   "past_key_values": None, "use_cache": False,
+                                                   "position_embeddings": None, "prev_topk_indices": None})[0]  # fmt: skip
                 mixed = substitute(mixed.squeeze(0), mixed_exact)
             streams = post_(layer, fused, post, comb, mixed, mixed_exact, streams, exact)
             fused, post, comb, x, exact = pre(layer, layer.ffn_hc, layer.post_attention_layernorm, streams)
@@ -1699,9 +1760,11 @@ def _vllm_backward_runner(input_ids: torch.Tensor, position_ids: torch.Tensor, k
                 with differentiable():
                     out = _mlp(layer, x, ctx)
                 return post_(layer, fused, post, comb, out, out.detach(), streams, exact)
-            with torch.no_grad():
-                mlp_exact = _mlp(layer, exact[2], ctx)
-            with _vllm_mlp_quantization(layer):
+            mlp_exact = record.pop("out", None)  # the forward's MoE output (ctx.keep_moe_out)
+            if mlp_exact is None:
+                with torch.no_grad(), _phase("exact.mlp"):
+                    mlp_exact = _mlp(layer, exact[2], ctx)
+            with _vllm_mlp_quantization(layer), _phase("stock.mlp"):
                 if "routed_experts" in extra:
                     out = layer.mlp(x.unsqueeze(0), routed_experts=extra["routed_experts"][:, :, layer._replay_layer_idx])
                 else:
@@ -1953,6 +2016,7 @@ def aligned_logprobs(model: Any, input_ids: torch.Tensor, position_ids: torch.Te
                                 tp=getattr(model, "_vllm_aligned_tensor_parallel", 1),
                                 prefill_chunk=getattr(model, "_vllm_aligned_prefill_chunk", 0),
                                 sp_group=group, shard=shard, sp_chunk=chunk, sp_tokens=tokens)  # fmt: skip
+    _log_phases(tokens)
     if mode == "vllm_op":
         _log_memory(model, input_ids.numel())
         ctx.keep_moe_out = ctx.replay is not None
@@ -1961,19 +2025,23 @@ def aligned_logprobs(model: Any, input_ids: torch.Tensor, position_ids: torch.Te
         # With a turn plan the mixers take the per-op backward: the stock KDA cannot start from another request's
         # state, and the per-op references follow the plan's spans.
         per_op = frozenset({"mixer"}) if turns is not None else frozenset()
+        keep = os.environ.get(KEEP_OUTPUTS_ENV, "1" if group is not None else "0") == "1"
+        ctx.keep_moe_out, ctx.keep_mixer_out = keep, keep and "mixer" not in per_op
         run_backward = _vllm_backward_runner(local_ids, local_positions, kwargs, ctx, per_op=per_op)
     else:
         run_backward = _stock_layer_runner(backbone, local_ids, local_positions, kwargs, ctx.replay)
-    hidden = aligned_hidden(backbone, local_ids, config, ctx, run_backward)
-    logprobs = ops.lm_head_logprobs(
-        hidden,
-        model.lm_head.weight,
-        labels.reshape(-1) if shard is None else labels.reshape(-1)[shard],
-        tensor_parallel=ctx.tp,
-        temperature=temperature,
-        token_chunk_size=model._vllm_aligned_token_chunk_size,
-        fp32=model._vllm_aligned_lm_head_fp32,
-    )
+    with _phase("layers"):
+        hidden = aligned_hidden(backbone, local_ids, config, ctx, run_backward)
+    with _phase("lm_head"):
+        logprobs = ops.lm_head_logprobs(
+            hidden,
+            model.lm_head.weight,
+            labels.reshape(-1) if shard is None else labels.reshape(-1)[shard],
+            tensor_parallel=ctx.tp,
+            temperature=temperature,
+            token_chunk_size=model._vllm_aligned_token_chunk_size,
+            fp32=model._vllm_aligned_lm_head_fp32,
+        )
     if turns is None:
         return logprobs
     if group is not None:

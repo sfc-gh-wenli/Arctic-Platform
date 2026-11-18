@@ -21,9 +21,11 @@ Hugging Face iterator.
 
 from __future__ import annotations
 
+import os
 from typing import Literal
 
 from pydantic import Field
+from pydantic import field_validator
 
 from arctic_platform.model.config import ModelSpec
 from arctic_platform.model.loader import LoadedModel
@@ -31,6 +33,8 @@ from arctic_platform.model.loader import LoaderContext
 from arctic_platform.model.loader import register_loader
 from arctic_platform.model.loaders.generic_moe import GenericMoeOptions
 from arctic_platform.model.loaders.qwen3_5_moe import Qwen3_5MoeOptions
+
+VLLM_ALIGNED_ENV_PREFIX = "ARCTIC_VLLM_ALIGNED_"
 
 
 class FlashMoeOptions(GenericMoeOptions):
@@ -96,6 +100,21 @@ class Glm5NextOptions(FlashMoeOptions):
             " set to the same size: prompts are then prefilled that many tokens at a time, as the sampler cuts them."
         ),
     )
+    vllm_aligned_env: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Experimental, with vllm_aligned. ARCTIC_VLLM_ALIGNED_* switches of the aligned forward, set in every"
+            " trainer process at load (to compare its variants on one image)."
+        ),
+    )
+
+    @field_validator("vllm_aligned_env")
+    @classmethod
+    def _aligned_switches_only(cls, env: dict[str, str]) -> dict[str, str]:
+        stray = sorted(k for k in env if not k.startswith(VLLM_ALIGNED_ENV_PREFIX))
+        if stray:
+            raise ValueError(f"vllm_aligned_env takes {VLLM_ALIGNED_ENV_PREFIX}* variables only, got {stray}")
+        return env
 
 
 class _FlashLoadOptions(Qwen3_5MoeOptions):
@@ -104,6 +123,7 @@ class _FlashLoadOptions(Qwen3_5MoeOptions):
     vllm_aligned_tensor_parallel: int = 1
     vllm_aligned_backward: str = "vllm"
     vllm_aligned_prefill_chunk: int = 0
+    vllm_aligned_env: dict[str, str] = {}
 
 
 def _matches(family: str):
@@ -218,6 +238,7 @@ def load_glm5_next(ctx: LoaderContext) -> LoadedModel:
     if options.vllm_aligned:
         from arctic_platform.model.implementations.vllm_aligned.glm5_next import apply_vllm_aligned_glm5_next
 
+        os.environ.update(options.vllm_aligned_env)
         chunk = options.fused_lm_head_token_chunk_size
         apply_vllm_aligned_glm5_next(
             loaded.model,
