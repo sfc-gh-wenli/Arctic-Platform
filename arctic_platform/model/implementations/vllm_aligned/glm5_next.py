@@ -1557,9 +1557,10 @@ def turn_layout(plan: torch.Tensor, cu_seqlens: torch.Tensor, *, block_size: int
 
     ``expand_index`` is each span token's packed position, ``positions`` its position in its row, ``cu`` the spans'
     boundaries, ``output_index`` the span token whose logprob each packed position returns (``-1`` for none: the
-    first span computing the position, or the one the plan marks), ``first_index`` that first span's token. A span's
-    keys are its row's positions up to its end: before its cache hit, page by page, the tokens of the span that wrote
-    the page, then its own
+    first span computing the position, or the one the plan marks), ``replay_index`` the token of the first of the
+    row's own spans (those returning logprobs; every span of a row where none does) computing it, ``-1`` if none
+    does. A span's keys are its row's positions up to its end: before its cache hit, page by page, the tokens of the
+    span that wrote the page, then its own
     (``key_index`` over the expanded tokens, ``key_cu`` its boundaries). ``kda`` replays every span's prefill
     chunks and decode runs, resuming from the state its provider had at the hit (:func:`_kda_steps_layout`)."""
     import types
@@ -1586,7 +1587,12 @@ def turn_layout(plan: torch.Tensor, cu_seqlens: torch.Tensor, *, block_size: int
     for i in reversed(range(len(spans))):
         span, r = spans[i], row_starts[i]
         output_index[r + span.start : r + span.end] = torch.arange(starts[i], starts[i] + lengths[i])
-    first_index = output_index.clone()
+    rows_with_outputs = {span.row for span in spans if span.outputs}
+    replay_index = torch.full((bounds[-1],), -1, dtype=torch.long)
+    for i in reversed(range(len(spans))):
+        span, r = spans[i], row_starts[i]
+        if span.outputs or span.row not in rows_with_outputs:
+            replay_index[r + span.start : r + span.end] = torch.arange(starts[i], starts[i] + lengths[i])
     for i, (span, r) in enumerate(zip(spans, row_starts)):
         if span.outputs:
             outputs = torch.tensor(span.outputs)
@@ -1611,7 +1617,7 @@ def turn_layout(plan: torch.Tensor, cu_seqlens: torch.Tensor, *, block_size: int
         positions=positions.to(device),
         cu=torch.tensor(starts, dtype=torch.int32, device=device),
         output_index=output_index.to(device),
-        first_index=first_index.to(device),
+        replay_index=replay_index.to(device),
         key_index=torch.cat(key_index).to(device),
         key_cu=torch.cat([torch.zeros(1, dtype=torch.long), torch.cumsum(key_lengths, 0)]).to(torch.int32).to(device),
         kda=_kda_steps_layout(kda, device),
@@ -1622,11 +1628,13 @@ def plan_routes(routes: torch.Tensor, turns: Any) -> torch.Tensor:
     """Router-replay routes (``[tokens, layers, top_k]``, one per packed position) for the span tokens of
     :func:`turn_layout`.
 
-    The trajectory's last capture holds one route per row position, that of the first request to compute it
-    (Arctic-Platform #473). Only that request's span replays it; a later request's recompute of the position (a
-    re-prefilled page tail) gets ``-1``, which :func:`replay_mask` rejects, so it routes itself as the sampler's did."""
+    The trajectory's last capture holds one route per row position, that of the trajectory's first request to compute
+    it (Arctic-Platform #473). Only that request's span replays it. Every other span gets ``-1``, which
+    :func:`replay_mask` rejects, so it routes itself as the sampler's did: a later request's recompute of the position
+    (a re-prefilled page tail), and another trajectory's request whose cached pages the row read, for which the
+    capture holds the routes of whichever request first published those pages, not necessarily that one."""
     span_tokens = torch.arange(turns.expand_index.numel(), device=turns.expand_index.device)
-    first = turns.first_index[turns.expand_index] == span_tokens
+    first = turns.replay_index[turns.expand_index] == span_tokens
     return torch.where(first[:, None, None], routes[turns.expand_index].to(torch.int32), -1)
 
 

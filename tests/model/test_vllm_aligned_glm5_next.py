@@ -601,7 +601,7 @@ def test_turn_layout_reads_cached_pages_from_their_writer_and_resumes_its_state(
         (False, [10, 11, 12], [0, 3], [2], [True], [(2, (0, 8))], []),
         (True, [13], [0, 1], [2], [True], [], []),
     ]
-    assert turns.first_index.tolist() == list(range(10)) + [12, 13]
+    assert turns.replay_index.tolist() == list(range(10)) + [12, 13]
 
 
 def test_plan_routes_replay_on_the_first_request_to_compute_a_position_only():
@@ -622,6 +622,28 @@ def test_plan_routes_replay_on_the_first_request_to_compute_a_position_only():
     # span tokens 10 and 11 are the second request's recompute of positions 8 and 9
     assert replayed.tolist() == [True] * 10 + [False, False, True, True]
     assert torch.equal(out[replayed, 0], routes[turns.expand_index[replayed], 0].to(torch.int32))
+
+
+def test_plan_routes_leave_another_trajectorys_request_to_route_itself():
+    from arctic_platform.model.implementations.vllm_aligned.glm5_next import plan_routes
+    from arctic_platform.model.implementations.vllm_aligned.glm5_next import replay_mask
+    from arctic_platform.model.implementations.vllm_aligned.glm5_next import turn_layout
+    from arctic_platform.model.implementations.vllm_aligned.turn_plan import encode_turns
+
+    # Another conversation's request wrote pages [0, 8) (no logprobs here); the row's own request hit them at 8.
+    plan = encode_turns(12, [{"start": 0, "chunk_ends": [8], "prompt_end": 8, "end": 9, "outputs": []},
+                             {"start": 8, "chunk_ends": [11], "prompt_end": 11, "end": 12, "outputs": [10]}],
+                        block_size=4)  # fmt: skip
+    turns = turn_layout(plan, torch.tensor([0, 12], dtype=torch.int32), block_size=4, device=torch.device("cpu"))
+    assert turns.expand_index.tolist() == list(range(9)) + [8, 9, 10, 11]
+    assert turns.replay_index.tolist() == [-1] * 8 + [9, 10, 11, 12]
+    routes = torch.stack([torch.arange(4) + 4 * (p % 3) for p in range(12)]).to(torch.uint8)[:, None, :]
+    replayed = replay_mask(plan_routes(routes, turns)[:, 0], 16)
+    assert replayed.tolist() == [False] * 9 + [True] * 4
+    # a row where no span returns logprobs (a plan-free row in a call with plans) replays on its first spans
+    bare = encode_turns(12, [{"start": 0, "chunk_ends": [8], "prompt_end": 8, "end": 12, "outputs": []}], block_size=4)
+    bare_turns = turn_layout(bare, torch.tensor([0, 12], dtype=torch.int32), block_size=4, device=torch.device("cpu"))
+    assert replay_mask(plan_routes(routes, bare_turns)[:, 0], 16).all()
 
 
 def _router_config():
