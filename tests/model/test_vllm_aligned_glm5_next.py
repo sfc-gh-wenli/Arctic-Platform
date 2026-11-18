@@ -811,7 +811,6 @@ def test_sequence_parallel_mixer_runs_the_whole_sequence_and_keeps_the_shards_ro
     from arctic_platform.model.implementations.vllm_aligned import glm5_next
 
     whole = torch.arange(8.0).reshape(8, 1)
-    shard = slice(4, 8)
     seen = {}
 
     def sparse_attention(attn, x, positions, cu_seqlens, config, record=None, tp=1, keys=None):
@@ -825,21 +824,23 @@ def test_sequence_parallel_mixer_runs_the_whole_sequence_and_keeps_the_shards_ro
         return [sparse_attention(attn, x, positions, cu_seqlens, config, record, tp, keys)]
 
     def all_to_all_single(output, input, output_split_sizes, input_split_sizes, group=None):
+        # Rank 0 sends TP rank 0's rows of either shard; stand-in for rank 1's TP rank 1: its partial of tokens 4-7.
+        assert input_split_sizes == [4, 4] and output_split_sizes == [4, 4]
         output.copy_(input)
 
-    # One sequence-parallel rank holding the second half of the sequence (its peer's half is all it gathers).
+    # SP rank 0 of 2 against TP 2: it computes TP rank 0 over the whole sequence and owns tokens 0-3.
     monkeypatch.setattr(glm5_next, "_gather_rows", lambda group, x, chunk, total: whole)
     monkeypatch.setattr(glm5_next, "mla_partials", partials)
-    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 1)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
     monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 0)
     monkeypatch.setattr(torch.distributed, "all_to_all_single", all_to_all_single)
     layer = types.SimpleNamespace(block_type="deepseek_sparse_attention", self_attn=None)
     ctx = types.SimpleNamespace(config=None, positions=None, cu_seqlens=None, turns=None, replay={}, sp_group=object(),
-                                shard=slice(0, 4), sp_chunk=4, sp_tokens=8, tp=1)  # fmt: skip
+                                shard=slice(0, 4), sp_chunk=4, sp_tokens=8, tp=2)  # fmt: skip
     with torch.no_grad():
-        out = glm5_next._mixer(layer, whole[shard], ctx)
+        out = glm5_next._mixer(layer, whole[:4], ctx)
     assert seen["tokens"] == 8
-    assert torch.equal(out, whole[:4] * 10)
+    assert torch.equal(out, (whole[:4] + whole[4:]) * 10)
     assert torch.equal(ctx.replay[id(layer)]["topk"], torch.arange(16).reshape(8, 2)[:4])
 
 
@@ -858,7 +859,7 @@ def test_sequence_parallel_ranks_sharing_a_tensor_parallel_rank_run_mla_only_at_
         return [x[queries] * 10]
 
     def all_to_all_single(output, input, output_split_sizes, input_split_sizes, group=None):
-        assert output_split_sizes == [0, 3] and input_split_sizes == [0, 3]
+        assert output_split_sizes == [0, 2] and input_split_sizes == [0, 2]
         output.copy_(input)
 
     monkeypatch.setattr(glm5_next, "_gather_rows", lambda group, x, chunk, total: whole)
@@ -871,9 +872,75 @@ def test_sequence_parallel_ranks_sharing_a_tensor_parallel_rank_run_mla_only_at_
                                 shard=slice(3, 5), sp_chunk=3, sp_tokens=5, tp=1)  # fmt: skip
     with torch.no_grad():
         out = glm5_next._mixer(layer, whole[3:], ctx)
-    assert seen["queries"] == [3, 4, 4]
+    assert seen["queries"] == [3, 4]
     assert torch.equal(out, whole[3:] * 10)
     assert torch.equal(ctx.replay[id(layer)]["topk"], torch.arange(10).reshape(5, 2)[3:])
+
+
+def test_sequence_parallel_ranks_sharing_a_tensor_parallel_rank_split_kda_at_request_boundaries(monkeypatch):
+    import types
+
+    from arctic_platform.model.implementations.vllm_aligned import glm5_next
+
+    # Two SP ranks, one TP rank, requests [0, 2), [2, 7), [7, 10): the cut nearest half the tokens is 7. Rank 1 owns
+    # tokens [5, 10), runs the last request only and gets [5, 7) from rank 0.
+    whole = torch.arange(10.0).reshape(10, 1)
+    seen = {}
+
+    def partials(attn, x, cu_seqlens, config, prompt_lens, trace, tp, prefill_chunk, layout, ranks):
+        seen.update(x=x.flatten().tolist(), cu=cu_seqlens.tolist(), prompt_lens=prompt_lens.tolist(), layout=layout)
+        return [x * 10]
+
+    def all_to_all_single(output, input, output_split_sizes, input_split_sizes, group=None):
+        assert output_split_sizes == [2, 3] and input_split_sizes == [0, 3]
+        output[:2] = torch.tensor([[50.0], [60.0]])
+        output[2:] = input
+
+    monkeypatch.setattr(glm5_next, "_gather_rows", lambda group, x, chunk, total: whole)
+    monkeypatch.setattr(glm5_next, "kda_partials", partials)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 1)
+    monkeypatch.setattr(torch.distributed, "all_to_all_single", all_to_all_single)
+    layer = types.SimpleNamespace(block_type="linear_attention", self_attn=None)
+    ctx = types.SimpleNamespace(config=None, positions=None, cu_seqlens=torch.tensor([0, 2, 7, 10], dtype=torch.int32),
+                                prompt_lens=torch.tensor([2, 4, 3]), turns=None, replay=None, sp_group=object(),
+                                shard=slice(5, 10), sp_chunk=5, sp_tokens=10, tp=1)  # fmt: skip
+    with torch.no_grad():
+        out = glm5_next._mixer(layer, whole[5:], ctx)
+    assert seen == {"x": [7.0, 8.0, 9.0], "cu": [0, 3], "prompt_lens": [3], "layout": None}
+    assert torch.equal(out, whole[5:] * 10)
+
+
+def test_a_turn_plan_rows_kda_replay_cut_out_of_the_batch_is_the_rows_own():
+    import types
+
+    from arctic_platform.model.implementations.vllm_aligned import glm5_next
+    from arctic_platform.model.implementations.vllm_aligned.turn_plan import encode_turns
+
+    cpu = torch.device("cpu")
+    first = encode_turns(8, [{"start": 0, "chunk_ends": [8], "prompt_end": 8, "end": 8, "outputs": []}], block_size=4)
+    second = encode_turns(12, [{"start": 0, "chunk_ends": [8], "prompt_end": 8, "end": 10, "outputs": [7, 8]},
+                               {"start": 8, "chunk_ends": [11], "prompt_end": 11, "end": 12, "outputs": [10]}],
+                          block_size=4)  # fmt: skip
+    first = torch.cat([first, torch.zeros_like(first)], 1)  # a column of no request, as rows of fewer turns pad
+    turns = glm5_next.turn_layout(torch.cat([first, second]), torch.tensor([0, 8, 20], dtype=torch.int32),
+                                  block_size=4, device=cpu)  # fmt: skip
+    assert turns.row_spans == [0, 1, 3] and turns.row_bounds == [0, 8, 22]
+    alone = glm5_next.turn_layout(second, torch.tensor([0, 12], dtype=torch.int32), block_size=4, device=cpu)
+    seen = {}
+
+    def partials(attn, x, cu_seqlens, config, prompt_lens, trace, tp, prefill_chunk, layout, ranks):
+        seen.update(x=x.flatten().tolist(), cu=cu_seqlens.tolist(), layout=layout)
+        return [x]
+
+    ctx = types.SimpleNamespace(turns=turns, sp_cache={}, config=None, tp=1)
+    glm5_next.kda_partials, original = partials, glm5_next.kda_partials
+    try:
+        glm5_next._kda_partials_between(None, torch.arange(22.0).reshape(22, 1), ctx, [0], 8, 22)
+    finally:
+        glm5_next.kda_partials = original
+    assert seen["x"] == [float(t) for t in range(8, 22)] and seen["cu"] == alone.cu.tolist()
+    assert _steps(seen["layout"]) == _steps(alone.kda)
 
 
 def test_sequence_parallel_ranks_split_the_tensor_parallel_work_and_every_owner_gets_each_partial_once():

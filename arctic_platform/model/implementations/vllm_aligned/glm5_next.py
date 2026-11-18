@@ -60,7 +60,7 @@ from arctic_platform.model.implementations.vllm_aligned import ops
 FP8_BLOCK = 128  # block-FP8 weight block (rows and columns)
 # "0": run the KDA ops before o_proj once per emulated TP rank instead of once over all of them (same bits).
 TP_BATCH_ENV = "ARCTIC_VLLM_ALIGNED_TP_BATCH"
-# "0": a sequence-parallel rank computes its MLA partials at every token, not only at the owners' it sends them to.
+# "0": a sequence-parallel rank computes its mixer partials at every token, not only at those it hands them on for.
 SP_QUERIES_ENV = "ARCTIC_VLLM_ALIGNED_SP_QUERIES"
 
 # Set while a layer's backward recomputes the aligned forward with every kernel call differentiable (``vllm_op``).
@@ -946,80 +946,180 @@ class _AllToAllRows(torch.autograd.Function):
         return None, out, None, None
 
 
-def _route_partials(group: Any, partials: dict[int, torch.Tensor], source: Callable[[int, int], int], tp: int,
-                    chunk: int, shard: slice, served: list[int]) -> torch.Tensor:
+def _pieces(spans: list[tuple[int, int]], lo: int, hi: int) -> list[tuple[int, int, int]]:
+    """The parts of ``spans`` (sorted token intervals whose rows are concatenated) inside ``[lo, hi)``: each part's
+    row offset in the concatenation, first token and length."""
+    out, offset = [], 0
+    for a, b in spans:
+        first, last = max(a, lo), min(b, hi)
+        if first < last:
+            out.append((offset + first - a, first, last - first))
+        offset += b - a
+    return out
+
+
+def _route_partials(group: Any, partials: dict[int, torch.Tensor], owned: Callable[[int], list[int]],
+                    spans_of: Callable[[int], list[tuple[int, int]]], tp: int, chunk: int,
+                    shard: slice) -> torch.Tensor:  # fmt: skip
     """Each token shard's owner receives every TP rank's partial rows for its tokens (one all-to-all) and adds them
-    as vLLM's all-reduce does (:func:`tp_sum`, rank order): the owner's rows of the all-reduced mixer output. The
-    partials hold ``chunk`` rows for each owner of ``served`` in turn (the last padded)."""
+    as vLLM's all-reduce does (:func:`tp_sum`, rank order): the owner's rows of the all-reduced mixer output. SP rank
+    ``s`` holds the partials of its TP ranks ``owned(s)`` at the tokens ``spans_of(s)``; the SP ranks holding one TP
+    rank cover every token once between them."""
     size, me = torch.distributed.get_world_size(group), torch.distributed.get_rank(group)
     sample = next(iter(partials.values()))
-    rows = chunk * len(served)
-    padded = {r: torch.nn.functional.pad(p, [0, 0, 0, rows - p.shape[0]]) for r, p in partials.items()}
     send, send_rows = [], []
     for owner in range(size):
-        ranks = [r for r in sorted(padded) if source(r, owner) == me]
-        if ranks:
-            block = served.index(owner)
-            send += [padded[r][block * chunk : (block + 1) * chunk] for r in ranks]
-        send_rows.append(len(ranks) * chunk)
-    senders = [[r for r in range(tp) if source(r, me) == s] for s in range(size)]
-    recv_rows = [len(ranks) * chunk for ranks in senders]
-    flat = torch.cat(send) if send else sample.new_empty((0, sample.shape[-1]))
+        parts = _pieces(spans_of(me), owner * chunk, (owner + 1) * chunk)
+        send += [partials[r][offset : offset + n] for r in sorted(partials) for offset, _, n in parts]
+        send_rows.append(len(partials) * sum(n for _, _, n in parts))
+    arriving, recv_rows = [], []
+    for s in range(size):
+        parts = _pieces(spans_of(s), shard.start, shard.stop)
+        arriving += [(r, first, n) for r in sorted(owned(s)) for _, first, n in parts]
+        recv_rows.append(len(owned(s)) * sum(n for _, _, n in parts))
+    flat = torch.cat(send) if send else sample[:0]
     received = _AllToAllRows.apply(group, flat, send_rows, recv_rows)
-    pieces, offset = {}, 0
-    for ranks in senders:
-        for r in ranks:
-            pieces[r] = received[offset : offset + chunk]
-            offset += chunk
-    return tp_sum([pieces[r] for r in range(tp)])[: shard.stop - shard.start]
+    by_rank: dict[int, list] = {r: [] for r in range(tp)}
+    offset = 0
+    for r, first, n in arriving:
+        by_rank[r].append((first, received[offset : offset + n]))
+        offset += n
+    pieces = []
+    for r in range(tp):
+        parts = [rows for _, rows in sorted(by_rank[r], key=lambda part: part[0])]
+        if sum(rows.shape[0] for rows in parts) != shard.stop - shard.start:
+            raise RuntimeError(f"TP rank {r}'s partials do not cover tokens {shard.start}-{shard.stop} once")
+        pieces.append(torch.cat(parts) if parts else received[:0])
+    return tp_sum(pieces)
+
+
+def _sp_unit_bounds(ctx: Any) -> list[int]:
+    """The packed-token boundaries of the pieces whose KDA recurrences are independent: the requests, or with a turn
+    plan its rows (a span resumes only from its own row's)."""
+    cache = ctx.sp_cache
+    if "units" not in cache:
+        turns = getattr(ctx, "turns", None)
+        cache["units"] = list(turns.row_bounds) if turns is not None else ctx.cu_seqlens.tolist()
+    return cache["units"]
+
+
+def _sp_spans(ctx: Any, size: int, kda: bool) -> Callable[[int], list[tuple[int, int]]]:
+    """The packed-token intervals at which each sequence-parallel rank computes its TP ranks' mixer partials
+    (:func:`_route_partials`): the shards of the owners it hands them to (:func:`_sp_tp_split`). Where several SP ranks
+    compute one TP rank KDA instead cuts the sequence between them at the request (turn-plan row) boundaries nearest
+    even shares, so that each runs the recurrences of its own requests."""
+    key = ("spans", kda)
+    if key not in ctx.sp_cache:
+        tp, chunk, tokens = getattr(ctx, "tp", 1), ctx.sp_chunk, ctx.sp_tokens
+        owned, source = _sp_tp_split(size, tp)
+        if kda and size > tp and size % tp == 0 and os.environ.get(SP_QUERIES_ENV, "1") != "0":
+            copies, bounds = size // tp, _sp_unit_bounds(ctx)
+            cuts = [0] + [min(bounds, key=lambda b: abs(b - tokens * c / copies)) for c in range(1, copies)] + [tokens]
+            cuts = [max(cuts[: i + 1]) for i in range(len(cuts))]
+            table = [[(cuts[s % copies], cuts[s % copies + 1])] if cuts[s % copies] < cuts[s % copies + 1] else []
+                     for s in range(size)]  # fmt: skip
+        else:
+            table = []
+            for s in range(size):
+                spans: list[list[int]] = []
+                for o in range(size):
+                    lo, hi = min(o * chunk, tokens), min((o + 1) * chunk, tokens)
+                    if lo == hi or not any(source(r, o) == s for r in owned(s)):
+                        continue
+                    if spans and spans[-1][1] == lo:
+                        spans[-1][1] = hi
+                    else:
+                        spans.append([lo, hi])
+                table.append([tuple(span) for span in spans])
+        ctx.sp_cache[key] = table
+    return ctx.sp_cache[key].__getitem__
 
 
 def _sequence_parallel_mixer(layer: Any, x: torch.Tensor, ctx: Any) -> torch.Tensor:
     """The mixer of a sequence-parallel rank's token shard. The layer input is gathered from every rank; the rank
-    computes the ``o_proj`` partials of its share of the sampler's tensor-parallel ranks (:func:`_sp_tp_split`) over
-    the whole packed sequence, the same calls as without sequence parallelism (MLA's only at the queries of the
-    owners it sends to, when ranks share a TP rank's owners); one all-to-all hands each shard's
-    owner every rank's partial rows, which it adds in rank order, so the output has the same bits. The sparse top-k
-    rows the backward's stock recompute replays are the shard's queries' (global key indices, as the stock
-    context-parallel attention reads them). Differentiated (the per-op backward), the gather and the all-to-all
-    carry the gradients back to the ranks that computed each part."""
+    computes the ``o_proj`` partials of its share of the sampler's tensor-parallel ranks (:func:`_sp_tp_split`) with
+    the same calls as without sequence parallelism, at the tokens it hands them on for (:func:`_sp_spans`: MLA's
+    queries, KDA's requests); one all-to-all hands each shard's owner every rank's partial rows, which it adds in rank
+    order, so the output has the same bits. The sparse top-k rows the backward's stock recompute replays are the
+    shard's queries' (global key indices, as the stock context-parallel attention reads them). Differentiated (the
+    per-op backward), the gather and the all-to-all carry the gradients back to the ranks that computed each part."""
     import types
 
     group = ctx.sp_group
-    size, me = torch.distributed.get_world_size(group), torch.distributed.get_rank(group)
-    tp, chunk = getattr(ctx, "tp", 1), ctx.sp_chunk
-    owned, source = _sp_tp_split(size, tp)
+    size, me, tp = torch.distributed.get_world_size(group), torch.distributed.get_rank(group), getattr(ctx, "tp", 1)
+    owned, _ = _sp_tp_split(size, tp)
     mine = owned(me)
-    # The owners this rank sends partial rows to; with several SP ranks computing one TP rank, a share of them.
-    served = [o for o in range(size) if any(source(r, o) == me for r in mine)]
-    queries = None
-    if len(served) < size and os.environ.get(SP_QUERIES_ENV, "1") != "0":
-        queries = torch.cat([torch.arange(o * chunk, (o + 1) * chunk) for o in served]).clamp(max=ctx.sp_tokens - 1)
-        queries = queries.to(x.device)
-    else:
-        served = list(range(size))
+    if getattr(ctx, "sp_cache", None) is None:
+        ctx.sp_cache = {}
+    spans_of = _sp_spans(ctx, size, layer.block_type == "linear_attention")
     record = _record(ctx, layer)
     whole = types.SimpleNamespace(**{**vars(ctx), "sp_group": None, "replay": None if record is None else {}})
-    partials = _mixer_partials(layer, _gather_rows(group, x, chunk, ctx.sp_tokens), whole, mine, queries)
+    x = _gather_rows(group, x, ctx.sp_chunk, ctx.sp_tokens)
+    partials = _mixer_partials(layer, x, whole, mine, spans_of(me))
     if record is not None:
         rows = whole.replay.get(id(layer), {}).get("topk")
         if rows is not None:
-            start = (served.index(me) * chunk) if queries is not None else ctx.shard.start
+            parts = _pieces(spans_of(me), ctx.shard.start, ctx.shard.stop)
+            start = parts[0][0] if parts else 0
             record["topk"] = rows[start : start + ctx.shard.stop - ctx.shard.start]
-    return _route_partials(group, dict(zip(mine, partials)), source, tp, chunk, ctx.shard, served)
+    return _route_partials(group, dict(zip(mine, partials)), owned, spans_of, tp, ctx.sp_chunk, ctx.shard)
 
 
 def _mixer_partials(layer: Any, x: torch.Tensor, ctx: Any, ranks,
-                    queries: torch.Tensor | None = None) -> list[torch.Tensor]:  # fmt: skip
+                    spans: list[tuple[int, int]] | None = None) -> list[torch.Tensor]:  # fmt: skip
     """The mixer's ``o_proj`` partials of the sampler's tensor-parallel ranks ``ranks``, before the all-reduce, at the
-    tokens ``queries`` (all of them by default)."""
-    tp, turns = getattr(ctx, "tp", 1), getattr(ctx, "turns", None)
+    packed tokens ``spans`` (sorted intervals, their rows concatenated; every token by default). MLA runs its queries
+    there; KDA runs the requests covering them (:func:`_kda_partials_between`)."""
+    tp, turns, tokens = getattr(ctx, "tp", 1), getattr(ctx, "turns", None), x.shape[0]
+    if spans == [(0, tokens)]:
+        spans = None
+    if spans is not None and not spans:
+        return [x[:0] * 0 for _ in ranks]  # keeps this rank's gather and all-to-all in the backward
+    queries = None if spans is None else torch.cat([torch.arange(a, b) for a, b in spans]).to(x.device)
+    restrict = queries is not None and os.environ.get(SP_QUERIES_ENV, "1") != "0"
     if layer.block_type == "linear_attention":
-        partials = kda_partials(layer.self_attn, x, ctx.cu_seqlens, ctx.config, getattr(ctx, "prompt_lens", None),
-                                None, tp, getattr(ctx, "prefill_chunk", 0), turns and turns.kda, ranks)  # fmt: skip
-        return partials if queries is None else [p[queries] for p in partials]
-    return mla_partials(layer.self_attn, x, ctx.positions, ctx.cu_seqlens, ctx.config, _record(ctx, layer), tp,
-                        turns and (turns.key_index, turns.key_cu), ranks, queries)  # fmt: skip
+        lo, hi = 0, tokens
+        if restrict:
+            bounds = _sp_unit_bounds(ctx)
+            lo, hi = max(b for b in bounds if b <= spans[0][0]), min(b for b in bounds if b >= spans[-1][1])
+        if (lo, hi) == (0, tokens):
+            partials = kda_partials(layer.self_attn, x, ctx.cu_seqlens, ctx.config, getattr(ctx, "prompt_lens", None),
+                                    None, tp, getattr(ctx, "prefill_chunk", 0), turns and turns.kda, ranks)  # fmt: skip
+        else:
+            partials = _kda_partials_between(layer.self_attn, x, ctx, ranks, lo, hi)
+        if queries is None or spans == [(lo, hi)]:
+            return partials
+        return [p[queries - lo] for p in partials]
+    record = _record(ctx, layer)
+    partials = mla_partials(layer.self_attn, x, ctx.positions, ctx.cu_seqlens, ctx.config, record, tp,
+                            turns and (turns.key_index, turns.key_cu), ranks, queries if restrict else None)  # fmt: skip
+    if queries is None or restrict:
+        return partials
+    if record is not None and "topk" in record:
+        record["topk"] = record["topk"][queries]
+    return [p[queries] for p in partials]
+
+
+def _kda_partials_between(attn: Any, x: torch.Tensor, ctx: Any, ranks, lo: int, hi: int) -> list[torch.Tensor]:
+    """:func:`kda_partials` of the requests (turn-plan rows) at packed tokens ``[lo, hi)``, whole ones: the same bits
+    as in the call over every request."""
+    tp, turns = getattr(ctx, "tp", 1), getattr(ctx, "turns", None)
+    key = ("kda", lo, hi)
+    if key not in ctx.sp_cache:
+        bounds = _sp_unit_bounds(ctx)
+        first, last = bounds.index(lo), bounds.index(hi)
+        if turns is None:
+            prompt_lens = getattr(ctx, "prompt_lens", None)
+            ctx.sp_cache[key] = (ctx.cu_seqlens[first : last + 1] - lo, None,
+                                 None if prompt_lens is None else prompt_lens[first:last])  # fmt: skip
+        else:
+            j0, j1 = turns.row_spans[first], turns.row_spans[last]
+            spans = [(start - lo, segments, None if resume is None else (resume[0] - j0, resume[1]))
+                     for start, segments, resume in turns.kda_spans[j0:j1]]  # fmt: skip
+            ctx.sp_cache[key] = (turns.cu[j0 : j1 + 1] - lo, _kda_steps_layout(spans, x.device), None)
+    cu, layout, prompt_lens = ctx.sp_cache[key]
+    return kda_partials(attn, x[lo:hi], cu, ctx.config, prompt_lens, None, tp, getattr(ctx, "prefill_chunk", 0),
+                        layout, ranks)  # fmt: skip
 
 
 def _mixer(layer: Any, x: torch.Tensor, ctx: Any) -> torch.Tensor:
@@ -1636,7 +1736,9 @@ def turn_layout(plan: torch.Tensor, cu_seqlens: torch.Tensor, *, block_size: int
     does. A span's keys are its row's positions up to its end: before its cache hit, page by page, the tokens of the
     span that wrote the page, then its own
     (``key_index`` over the expanded tokens, ``key_cu`` its boundaries). ``kda`` replays every span's prefill
-    chunks and decode runs, resuming from the state its provider had at the hit (:func:`_kda_steps_layout`)."""
+    chunks and decode runs, resuming from the state its provider had at the hit (:func:`_kda_steps_layout`, built
+    from ``kda_spans``). A span resumes only from its own row's: ``row_spans`` and ``row_bounds`` are the rows' first
+    spans and first span tokens (and the totals), the independent pieces of the KDA replay."""
     import types
 
     from arctic_platform.model.implementations.vllm_aligned.turn_plan import TurnSpan
@@ -1678,6 +1780,7 @@ def turn_layout(plan: torch.Tensor, cu_seqlens: torch.Tensor, *, block_size: int
             key_index.append(starts[writer] + page * block_size - spans[writer].start + torch.arange(block_size))
         key_index.append(torch.arange(starts[i], starts[i] + lengths[i]))
     key_lengths = torch.tensor([span.end for span in spans])
+    row_spans = [0] + [i + 1 for i in range(len(spans)) if i + 1 == len(spans) or spans[i + 1].row != spans[i].row]
     kda = []
     for i, span in enumerate(spans):
         resume = None
@@ -1695,6 +1798,9 @@ def turn_layout(plan: torch.Tensor, cu_seqlens: torch.Tensor, *, block_size: int
         key_index=torch.cat(key_index).to(device),
         key_cu=torch.cat([torch.zeros(1, dtype=torch.long), torch.cumsum(key_lengths, 0)]).to(torch.int32).to(device),
         kda=_kda_steps_layout(kda, device),
+        kda_spans=kda,
+        row_spans=row_spans,
+        row_bounds=[starts[i] for i in row_spans],
     )
 
 
