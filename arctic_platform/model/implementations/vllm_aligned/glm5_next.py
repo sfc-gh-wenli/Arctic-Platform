@@ -1557,8 +1557,9 @@ def turn_layout(plan: torch.Tensor, cu_seqlens: torch.Tensor, *, block_size: int
 
     ``expand_index`` is each span token's packed position, ``positions`` its position in its row, ``cu`` the spans'
     boundaries, ``output_index`` the span token whose logprob each packed position returns (``-1`` for none: the
-    first span computing the position, or the one the plan marks). A span's keys are its row's positions up to its
-    end: before its cache hit, page by page, the tokens of the span that wrote the page, then its own
+    first span computing the position, or the one the plan marks), ``first_index`` that first span's token. A span's
+    keys are its row's positions up to its end: before its cache hit, page by page, the tokens of the span that wrote
+    the page, then its own
     (``key_index`` over the expanded tokens, ``key_cu`` its boundaries). ``kda`` replays every span's prefill
     chunks and decode runs, resuming from the state its provider had at the hit (:func:`_kda_steps_layout`)."""
     import types
@@ -1585,6 +1586,7 @@ def turn_layout(plan: torch.Tensor, cu_seqlens: torch.Tensor, *, block_size: int
     for i in reversed(range(len(spans))):
         span, r = spans[i], row_starts[i]
         output_index[r + span.start : r + span.end] = torch.arange(starts[i], starts[i] + lengths[i])
+    first_index = output_index.clone()
     for i, (span, r) in enumerate(zip(spans, row_starts)):
         if span.outputs:
             outputs = torch.tensor(span.outputs)
@@ -1609,10 +1611,23 @@ def turn_layout(plan: torch.Tensor, cu_seqlens: torch.Tensor, *, block_size: int
         positions=positions.to(device),
         cu=torch.tensor(starts, dtype=torch.int32, device=device),
         output_index=output_index.to(device),
+        first_index=first_index.to(device),
         key_index=torch.cat(key_index).to(device),
         key_cu=torch.cat([torch.zeros(1, dtype=torch.long), torch.cumsum(key_lengths, 0)]).to(torch.int32).to(device),
         kda=_kda_steps_layout(kda, device),
     )
+
+
+def plan_routes(routes: torch.Tensor, turns: Any) -> torch.Tensor:
+    """Router-replay routes (``[tokens, layers, top_k]``, one per packed position) for the span tokens of
+    :func:`turn_layout`.
+
+    The trajectory's last capture holds one route per row position, that of the first request to compute it
+    (Arctic-Platform #473). Only that request's span replays it; a later request's recompute of the position (a
+    re-prefilled page tail) gets ``-1``, which :func:`replay_mask` rejects, so it routes itself as the sampler's did."""
+    span_tokens = torch.arange(turns.expand_index.numel(), device=turns.expand_index.device)
+    first = turns.first_index[turns.expand_index] == span_tokens
+    return torch.where(first[:, None, None], routes[turns.expand_index].to(torch.int32), -1)
 
 
 def plan_block_size(plan: torch.Tensor, cu_seqlens: torch.Tensor) -> int:
@@ -1721,8 +1736,7 @@ def aligned_logprobs(model: Any, input_ids: torch.Tensor, position_ids: torch.Te
         scored = torch.zeros(turns.expand_index.numel(), dtype=torch.bool, device=input_ids.device)
         scored[turns.output_index[turns.output_index >= 0]] = True
         input_ids = input_ids.reshape(-1)[turns.expand_index]
-        # one route per row position (the trajectory's last capture), so every span computing it replays it
-        routes = None if routes is None else routes[turns.expand_index]
+        routes = None if routes is None else plan_routes(routes, turns)
         position_ids = turns.positions
         labels = torch.where(scored, labels.reshape(-1)[turns.expand_index], -100)
     tokens, shard, chunk = input_ids.numel(), None, 0

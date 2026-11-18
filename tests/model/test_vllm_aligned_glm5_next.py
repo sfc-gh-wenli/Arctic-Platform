@@ -601,6 +601,27 @@ def test_turn_layout_reads_cached_pages_from_their_writer_and_resumes_its_state(
         (False, [10, 11, 12], [0, 3], [2], [True], [(2, (0, 8))], []),
         (True, [13], [0, 1], [2], [True], [], []),
     ]
+    assert turns.first_index.tolist() == list(range(10)) + [12, 13]
+
+
+def test_plan_routes_replay_on_the_first_request_to_compute_a_position_only():
+    from arctic_platform.model.implementations.vllm_aligned.glm5_next import plan_routes
+    from arctic_platform.model.implementations.vllm_aligned.glm5_next import replay_mask
+    from arctic_platform.model.implementations.vllm_aligned.glm5_next import turn_layout
+    from arctic_platform.model.implementations.vllm_aligned.turn_plan import encode_turns
+
+    # The first request decodes positions 8 and 9; the second re-prefills them from its hit at 8 (a page tail).
+    plan = encode_turns(12, [{"start": 0, "chunk_ends": [8], "prompt_end": 8, "end": 10, "outputs": [7, 8]},
+                             {"start": 8, "chunk_ends": [11], "prompt_end": 11, "end": 12, "outputs": [10]}],
+                        block_size=4)  # fmt: skip
+    turns = turn_layout(plan, torch.tensor([0, 12], dtype=torch.int32), block_size=4, device=torch.device("cpu"))
+    routes = torch.stack([torch.arange(4) + 4 * (p % 3) for p in range(12)]).to(torch.uint8)[:, None, :]  # 1 layer
+    out = plan_routes(routes, turns)
+    assert out.dtype == torch.int32 and out.shape == (14, 1, 4)
+    replayed = replay_mask(out[:, 0], 16)
+    # span tokens 10 and 11 are the second request's recompute of positions 8 and 9
+    assert replayed.tolist() == [True] * 10 + [False, False, True, True]
+    assert torch.equal(out[replayed, 0], routes[turns.expand_index[replayed], 0].to(torch.int32))
 
 
 def _router_config():
