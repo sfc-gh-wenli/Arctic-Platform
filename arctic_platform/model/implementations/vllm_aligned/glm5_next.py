@@ -771,21 +771,26 @@ def mla_partials(attn: Any, x: torch.Tensor, positions: torch.Tensor, cu_seqlens
     q_b, q_b_lora = bf16_weight(attn.q_b_proj), lora_factors(attn.q_b_proj)
     o, o_lora = bf16_weight(attn.o_proj), lora_factors(attn.o_proj)
     heads_r = heads // tp
-    partials = []
+    q_ropes, q_latents = [], []
     for rank in ranks:
         q_b_r = tp_shard(q_b, tp, rank)
         q = add_lora(_linear(q_c, q_b_r), q_c, [_column_lora(q_b_lora, tp, rank)], (q_b_r.shape[0],))
         q = q.view(tokens, heads_r, nope + rope)
         q_nope, q_pe = q.split([nope, rope], dim=-1)
-        w_uk_t, w_uv = tp_shard(w_uk_t_all, tp, rank), tp_shard(w_uv_all, tp, rank)
-        q_latent = _op(_head_bmm_kernel, "ref_head_bmm", q_nope.transpose(0, 1), w_uk_t)
-        if rope:
-            k_cache, q_rope = kv_rows[:, latent:].unsqueeze(1).unsqueeze(1), q_pe
-        else:  # FA3's QV path needs a 64-wide Q/K: a zero query against the first 64 latent columns
-            k_cache, q_rope = v_cache[..., :64], q.new_zeros((tokens, heads_r, 64))
-        out = _op(_sparse_mla_kernel, "ref_sparse_mla", q_rope, k_cache, v_cache, q_latent, rows, valid,
-                  softmax_scale=(nope + rope) ** -0.5)  # fmt: skip
-        up = _op(_head_bmm_kernel, "ref_head_bmm", out.view(-1, heads_r, latent).transpose(0, 1), w_uv)
+        q_latents.append(_op(_head_bmm_kernel, "ref_head_bmm", q_nope.transpose(0, 1), tp_shard(w_uk_t_all, tp, rank)))
+        q_ropes.append(q_pe if rope else q.new_zeros((tokens, heads_r, 64)))
+    if rope:
+        k_cache = kv_rows[:, latent:].unsqueeze(1).unsqueeze(1)
+    else:  # FA3's QV path needs a 64-wide Q/K: a zero query against the first 64 latent columns
+        k_cache = v_cache[..., :64]
+    # One op for every rank: each rank's head slice runs the sampler's kernel; the reference takes all the heads at
+    # once (FlashMLA pads a call's heads to 64, so per-rank calls of a few heads each would each pay for 64).
+    outs = _op(_sparse_mla_ranks_kernel, "ref_sparse_mla", torch.cat(q_ropes, 1), k_cache, v_cache,
+               torch.cat(q_latents, 1), rows, valid, softmax_scale=(nope + rope) ** -0.5, heads_r=heads_r)  # fmt: skip
+    partials = []
+    for i, rank in enumerate(ranks):
+        out = outs[:, i * heads_r : (i + 1) * heads_r].contiguous()
+        up = _op(_head_bmm_kernel, "ref_head_bmm", out.transpose(0, 1), tp_shard(w_uv_all, tp, rank))
         up = up.view(tokens, heads_r * value)
         o_r = tp_shard(o, tp, rank, 1).contiguous()
         partials.append(add_lora(_linear(up, o_r), up, [_row_lora(o_lora, tp, rank)], (o_r.shape[0],)))
@@ -825,6 +830,15 @@ def _sparse_mla_kernel(q_rope, k_cache, v_cache, q_v, rows, valid, *, softmax_sc
         causal=True,
         fa_version=3,
     )
+
+
+def _sparse_mla_ranks_kernel(q_rope, k_cache, v_cache, q_v, rows, valid, *, softmax_scale: float, heads_r: int,
+                             **_) -> torch.Tensor:  # fmt: skip
+    """:func:`_sparse_mla_kernel` on each ``heads_r``-head slice of ``q_rope``/``q_v`` (an emulated TP rank's heads,
+    contiguous as the sampler's rank holds them), the outputs concatenated over heads."""
+    return torch.cat([_sparse_mla_kernel(qr.contiguous(), k_cache, v_cache, qv.contiguous(), rows, valid,
+                                         softmax_scale=softmax_scale)
+                      for qr, qv in zip(q_rope.split(heads_r, 1), q_v.split(heads_r, 1))], dim=1)  # fmt: skip
 
 
 def _gather_tokens(group: Any, x: torch.Tensor, dim: int = 0) -> torch.Tensor:
