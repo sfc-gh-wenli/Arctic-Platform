@@ -60,6 +60,8 @@ from arctic_platform.model.implementations.vllm_aligned import ops
 FP8_BLOCK = 128  # block-FP8 weight block (rows and columns)
 # "0": run the KDA ops before o_proj once per emulated TP rank instead of once over all of them (same bits).
 TP_BATCH_ENV = "ARCTIC_VLLM_ALIGNED_TP_BATCH"
+# "0": a sequence-parallel rank computes its MLA partials at every token, not only at the owners' it sends them to.
+SP_QUERIES_ENV = "ARCTIC_VLLM_ALIGNED_SP_QUERIES"
 
 # Set while a layer's backward recomputes the aligned forward with every kernel call differentiable (``vllm_op``).
 _DIFFERENTIABLE = contextvars.ContextVar("vllm_aligned_differentiable", default=False)
@@ -564,12 +566,14 @@ INDEXER_PADDED_HEADS = 32
 
 
 def indexer_topk(indexer: Any, x: torch.Tensor, q_c: torch.Tensor, positions: torch.Tensor, cu_seqlens: torch.Tensor,
-                 config: Any, width: int, keys: tuple[torch.Tensor, torch.Tensor] | None = None) -> torch.Tensor:  # fmt: skip
+                 config: Any, width: int, keys: tuple[torch.Tensor, torch.Tensor] | None = None,
+                 queries: torch.Tensor | None = None) -> torch.Tensor:  # fmt: skip
     """vLLM's kpool sparse-indexer top-k for whole prompts: ``[tokens, width]`` request-relative token ids, ``-1`` padded.
 
     ``keys`` (``key_index``, ``key_cu``) gives each request's key positions as packed token indices (the request's own
     tokens by default); with a turn plan a request's keys before its cache hit are the tokens of the request that
-    wrote them, and the returned ids are key positions.
+    wrote them, and the returned ids are key positions. ``queries`` (packed token indices) limits the rows to those
+    tokens' queries; the keys are still every token's.
 
     A token whose position is below ``index_topk`` gets its causal row (every earlier token). The others score the
     request's complete pools (``(pos + 1) // index_kpool`` of them) as the sampler's prefill does: ``wq_b`` and the
@@ -589,28 +593,31 @@ def indexer_topk(indexer: Any, x: torch.Tensor, q_c: torch.Tensor, positions: to
     from arctic_platform.inference.vllm.glm5_batch_invariance import deterministic_topk
 
     topk_tokens, kpool = config.index_topk, config.index_kpool
-    out = causal_topk(positions, width)
-    long_rows = torch.nonzero(positions >= topk_tokens).flatten()
+    query_positions = positions if queries is None else positions[queries]
+    out = causal_topk(query_positions, width)
+    long_rows = torch.nonzero(query_positions >= topk_tokens).flatten()
     if long_rows.numel() == 0:
         return out
     if getattr(config, "index_rope_head_dim", 0) or getattr(config, "qk_rope_head_dim", 0):
         raise NotImplementedError("vLLM-aligned sparse indexer covers mla_use_nope (no rotary embedding)")
     tokens = x.shape[0]
     head_dim, n_head = indexer.wk.weight.shape[0], indexer.weights_proj.weight.shape[0]
+    x_q, q_c = (x, q_c) if queries is None else (x[queries], q_c[queries])
+    rows_q = q_c.shape[0]
 
-    q = ops.linear_kernel(q_c, indexer.wq_b.weight).view(tokens, n_head, head_dim)
+    q = ops.linear_kernel(q_c, indexer.wq_b.weight).view(rows_q, n_head, head_dim)
     kw = ops.linear_kernel(x, torch.cat([indexer.wk.weight, indexer.weights_proj.weight]))
-    weights = matmul_fp32_out(x, indexer.weights_proj.weight.t().contiguous())
+    weights = matmul_fp32_out(x_q, indexer.weights_proj.weight.t().contiguous())
     k = F.layer_norm(kw[:, :head_dim].float(), (head_dim,), indexer.k_norm.weight.float(),
                      indexer.k_norm.bias.float(), INDEXER_K_NORM_EPS).to(kw.dtype)  # fmt: skip
     q_fp8, q_scale = kpool_ops.fwht128_quant_fp8(q.reshape(-1, head_dim))
-    q_fp8, q_scale = q_fp8.view(tokens, n_head, head_dim), q_scale.view(tokens, n_head, 1)
+    q_fp8, q_scale = q_fp8.view(rows_q, n_head, head_dim), q_scale.view(rows_q, n_head, 1)
     weights = (weights.unsqueeze(-1) * q_scale * (head_dim**-0.5 * n_head**-0.5)).squeeze(-1)
     gate_score = F.linear(x, indexer.index_kpool_compress_gate)
     if n_head < INDEXER_PADDED_HEADS:
         pad = INDEXER_PADDED_HEADS - n_head
-        q_fp8 = torch.cat([q_fp8, q_fp8.new_zeros(tokens, pad, head_dim)], dim=1)
-        weights = torch.cat([weights, weights.new_zeros(tokens, pad)], dim=1)
+        q_fp8 = torch.cat([q_fp8, q_fp8.new_zeros(rows_q, pad, head_dim)], dim=1)
+        weights = torch.cat([weights, weights.new_zeros(rows_q, pad)], dim=1)
 
     lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).long()
     key_index, key_cu = keys if keys is not None else (torch.arange(tokens, device=x.device), cu_seqlens)
@@ -627,15 +634,16 @@ def indexer_topk(indexer: Any, x: torch.Tensor, q_c: torch.Tensor, positions: to
         round_scale=True, return_compressed=True, write_cache=False,
     )  # fmt: skip
 
-    seq_of_token = torch.repeat_interleave(torch.arange(lengths.numel(), device=x.device), lengths)[long_rows]
+    long_tokens = long_rows if queries is None else queries[long_rows]
+    seq_of_token = torch.repeat_interleave(torch.arange(lengths.numel(), device=x.device), lengths)[long_tokens]
     ks = pool_starts[seq_of_token].to(torch.int32)
-    ke = ks + ((positions[long_rows] + 1) // kpool).to(torch.int32)
+    ke = ks + ((query_positions[long_rows] + 1) // kpool).to(torch.int32)
     logits = fp8_fp4_mqa_logits((q_fp8[long_rows], None), (k_pool, k_scale), weights[long_rows], ks, ke,
                                 clean_logits=False)  # fmt: skip
     pool_topk = torch.empty((long_rows.numel(), topk_tokens // kpool), dtype=torch.int32, device=x.device)
     deterministic_topk(logits, ks, ke, topk_tokens // kpool, pool_topk)
     expanded = kpool_ops.expand_pools_and_append_tail(pool_topk.to(torch.int64),
-                                                      (positions[long_rows] + 1).to(torch.int32), kpool)  # fmt: skip
+                                                      (query_positions[long_rows] + 1).to(torch.int32), kpool)  # fmt: skip
     rows = torch.full((long_rows.numel(), width), -1, dtype=torch.int32, device=x.device)
     rows[:, : expanded.shape[-1]] = expanded.to(torch.int32)
     out[long_rows] = rows
@@ -753,7 +761,7 @@ def mla_attention(attn: Any, x: torch.Tensor, positions: torch.Tensor, cu_seqlen
 
 def mla_partials(attn: Any, x: torch.Tensor, positions: torch.Tensor, cu_seqlens: torch.Tensor,
                  config: Any, record: dict | None, tp: int, keys: tuple[torch.Tensor, torch.Tensor] | None,
-                 ranks) -> list[torch.Tensor]:  # fmt: skip
+                 ranks, queries: torch.Tensor | None = None) -> list[torch.Tensor]:  # fmt: skip
     """vLLM's ``Glm5NextMLAAttention`` (sparse MLA with ``mla_use_nope``) on packed requests.
 
     Each token attends to the rows :func:`indexer_topk` selects (every earlier token below ``index_topk``, the
@@ -769,7 +777,9 @@ def mla_partials(attn: Any, x: torch.Tensor, positions: torch.Tensor, cu_seqlens
     At ``tp`` > 1 the replicated ``[q_a; kv_a]``, norms and indexer run once; each tensor-parallel rank of ``ranks``
     then runs its heads (its rows of ``q_b_proj`` and ``kv_b_proj``, its input columns of ``o_proj``) into its
     ``o_proj`` partial (:func:`mla_attention` all-reduces them). ``keys`` maps each request's key positions to packed
-    tokens (:func:`indexer_topk`).
+    tokens (:func:`indexer_topk`). ``queries`` (packed token indices) limits the partials, and the top-k ``record``
+    keeps, to those tokens' rows; every token is still a key. Each row has the bits of the full call: the per-query
+    kernels' tiles do not depend on how many rows a call has.
     """
     if not getattr(config, "mla_use_nope", True) and config.qk_rope_head_dim:
         raise NotImplementedError("vLLM-aligned sparse MLA covers mla_use_nope (no rotary embedding)")
@@ -791,7 +801,10 @@ def mla_partials(attn: Any, x: torch.Tensor, positions: torch.Tensor, cu_seqlens
 
     seq_of_token = torch.repeat_interleave(torch.arange(starts.numel(), device=x.device), lengths)
     with torch.no_grad():  # the selection is discrete: no gradient through the indexer
-        topk = indexer_topk(attn.indexer, x, q_c, positions, cu_seqlens, config, topk_buffer_width(config), keys)
+        topk = indexer_topk(attn.indexer, x, q_c, positions, cu_seqlens, config, topk_buffer_width(config), keys,
+                            queries)  # fmt: skip
+    if queries is not None:
+        q_c, seq_of_token, tokens = q_c[queries], seq_of_token[queries], queries.numel()
     if keys is None:
         rows = torch.where(topk >= 0, topk + starts.to(torch.int32)[seq_of_token, None], topk)
     else:
@@ -934,16 +947,20 @@ class _AllToAllRows(torch.autograd.Function):
 
 
 def _route_partials(group: Any, partials: dict[int, torch.Tensor], source: Callable[[int, int], int], tp: int,
-                    chunk: int, shard: slice) -> torch.Tensor:
+                    chunk: int, shard: slice, served: list[int]) -> torch.Tensor:
     """Each token shard's owner receives every TP rank's partial rows for its tokens (one all-to-all) and adds them
-    as vLLM's all-reduce does (:func:`tp_sum`, rank order): the owner's rows of the all-reduced mixer output."""
+    as vLLM's all-reduce does (:func:`tp_sum`, rank order): the owner's rows of the all-reduced mixer output. The
+    partials hold ``chunk`` rows for each owner of ``served`` in turn (the last padded)."""
     size, me = torch.distributed.get_world_size(group), torch.distributed.get_rank(group)
     sample = next(iter(partials.values()))
-    padded = {r: torch.nn.functional.pad(p, [0, 0, 0, chunk * size - p.shape[0]]) for r, p in partials.items()}
+    rows = chunk * len(served)
+    padded = {r: torch.nn.functional.pad(p, [0, 0, 0, rows - p.shape[0]]) for r, p in partials.items()}
     send, send_rows = [], []
     for owner in range(size):
         ranks = [r for r in sorted(padded) if source(r, owner) == me]
-        send += [padded[r][owner * chunk : (owner + 1) * chunk] for r in ranks]
+        if ranks:
+            block = served.index(owner)
+            send += [padded[r][block * chunk : (block + 1) * chunk] for r in ranks]
         send_rows.append(len(ranks) * chunk)
     senders = [[r for r in range(tp) if source(r, me) == s] for s in range(size)]
     recv_rows = [len(ranks) * chunk for ranks in senders]
@@ -960,7 +977,8 @@ def _route_partials(group: Any, partials: dict[int, torch.Tensor], source: Calla
 def _sequence_parallel_mixer(layer: Any, x: torch.Tensor, ctx: Any) -> torch.Tensor:
     """The mixer of a sequence-parallel rank's token shard. The layer input is gathered from every rank; the rank
     computes the ``o_proj`` partials of its share of the sampler's tensor-parallel ranks (:func:`_sp_tp_split`) over
-    the whole packed sequence, the same calls as without sequence parallelism; one all-to-all hands each shard's
+    the whole packed sequence, the same calls as without sequence parallelism (MLA's only at the queries of the
+    owners it sends to, when ranks share a TP rank's owners); one all-to-all hands each shard's
     owner every rank's partial rows, which it adds in rank order, so the output has the same bits. The sparse top-k
     rows the backward's stock recompute replays are the shard's queries' (global key indices, as the stock
     context-parallel attention reads them). Differentiated (the per-op backward), the gather and the all-to-all
@@ -968,26 +986,40 @@ def _sequence_parallel_mixer(layer: Any, x: torch.Tensor, ctx: Any) -> torch.Ten
     import types
 
     group = ctx.sp_group
-    owned, source = _sp_tp_split(torch.distributed.get_world_size(group), getattr(ctx, "tp", 1))
-    mine = owned(torch.distributed.get_rank(group))
+    size, me = torch.distributed.get_world_size(group), torch.distributed.get_rank(group)
+    tp, chunk = getattr(ctx, "tp", 1), ctx.sp_chunk
+    owned, source = _sp_tp_split(size, tp)
+    mine = owned(me)
+    # The owners this rank sends partial rows to; with several SP ranks computing one TP rank, a share of them.
+    served = [o for o in range(size) if any(source(r, o) == me for r in mine)]
+    queries = None
+    if len(served) < size and os.environ.get(SP_QUERIES_ENV, "1") != "0":
+        queries = torch.cat([torch.arange(o * chunk, (o + 1) * chunk) for o in served]).clamp(max=ctx.sp_tokens - 1)
+        queries = queries.to(x.device)
+    else:
+        served = list(range(size))
     record = _record(ctx, layer)
     whole = types.SimpleNamespace(**{**vars(ctx), "sp_group": None, "replay": None if record is None else {}})
-    partials = _mixer_partials(layer, _gather_rows(group, x, ctx.sp_chunk, ctx.sp_tokens), whole, mine)
+    partials = _mixer_partials(layer, _gather_rows(group, x, chunk, ctx.sp_tokens), whole, mine, queries)
     if record is not None:
         rows = whole.replay.get(id(layer), {}).get("topk")
         if rows is not None:
-            record["topk"] = rows[ctx.shard]
-    return _route_partials(group, dict(zip(mine, partials)), source, getattr(ctx, "tp", 1), ctx.sp_chunk, ctx.shard)
+            start = (served.index(me) * chunk) if queries is not None else ctx.shard.start
+            record["topk"] = rows[start : start + ctx.shard.stop - ctx.shard.start]
+    return _route_partials(group, dict(zip(mine, partials)), source, tp, chunk, ctx.shard, served)
 
 
-def _mixer_partials(layer: Any, x: torch.Tensor, ctx: Any, ranks) -> list[torch.Tensor]:
-    """The mixer's ``o_proj`` partials of the sampler's tensor-parallel ranks ``ranks``, before the all-reduce."""
+def _mixer_partials(layer: Any, x: torch.Tensor, ctx: Any, ranks,
+                    queries: torch.Tensor | None = None) -> list[torch.Tensor]:  # fmt: skip
+    """The mixer's ``o_proj`` partials of the sampler's tensor-parallel ranks ``ranks``, before the all-reduce, at the
+    tokens ``queries`` (all of them by default)."""
     tp, turns = getattr(ctx, "tp", 1), getattr(ctx, "turns", None)
     if layer.block_type == "linear_attention":
-        return kda_partials(layer.self_attn, x, ctx.cu_seqlens, ctx.config, getattr(ctx, "prompt_lens", None), None,
-                            tp, getattr(ctx, "prefill_chunk", 0), turns and turns.kda, ranks)  # fmt: skip
+        partials = kda_partials(layer.self_attn, x, ctx.cu_seqlens, ctx.config, getattr(ctx, "prompt_lens", None),
+                                None, tp, getattr(ctx, "prefill_chunk", 0), turns and turns.kda, ranks)  # fmt: skip
+        return partials if queries is None else [p[queries] for p in partials]
     return mla_partials(layer.self_attn, x, ctx.positions, ctx.cu_seqlens, ctx.config, _record(ctx, layer), tp,
-                        turns and (turns.key_index, turns.key_cu), ranks)  # fmt: skip
+                        turns and (turns.key_index, turns.key_cu), ranks, queries)  # fmt: skip
 
 
 def _mixer(layer: Any, x: torch.Tensor, ctx: Any) -> torch.Tensor:

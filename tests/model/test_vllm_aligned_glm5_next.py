@@ -820,7 +820,8 @@ def test_sequence_parallel_mixer_runs_the_whole_sequence_and_keeps_the_shards_ro
             record["topk"] = torch.arange(8 * 2).reshape(8, 2)
         return x * 10
 
-    def partials(attn, x, positions, cu_seqlens, config, record, tp, keys, ranks):
+    def partials(attn, x, positions, cu_seqlens, config, record, tp, keys, ranks, queries=None):
+        assert queries is None
         return [sparse_attention(attn, x, positions, cu_seqlens, config, record, tp, keys)]
 
     def all_to_all_single(output, input, output_split_sizes, input_split_sizes, group=None):
@@ -840,6 +841,39 @@ def test_sequence_parallel_mixer_runs_the_whole_sequence_and_keeps_the_shards_ro
     assert seen["tokens"] == 8
     assert torch.equal(out, whole[:4] * 10)
     assert torch.equal(ctx.replay[id(layer)]["topk"], torch.arange(16).reshape(8, 2)[:4])
+
+
+def test_sequence_parallel_ranks_sharing_a_tensor_parallel_rank_run_mla_only_at_their_owners_queries(monkeypatch):
+    import types
+
+    from arctic_platform.model.implementations.vllm_aligned import glm5_next
+
+    # Two SP ranks, one TP rank: each computes it, rank 1 for owner 1 alone (the last, short shard: tokens 3 and 4).
+    whole = torch.arange(5.0).reshape(5, 1)
+    seen = {}
+
+    def partials(attn, x, positions, cu_seqlens, config, record, tp, keys, ranks, queries=None):
+        seen["queries"] = queries.tolist()
+        record["topk"] = torch.arange(5 * 2).reshape(5, 2)[queries]
+        return [x[queries] * 10]
+
+    def all_to_all_single(output, input, output_split_sizes, input_split_sizes, group=None):
+        assert output_split_sizes == [0, 3] and input_split_sizes == [0, 3]
+        output.copy_(input)
+
+    monkeypatch.setattr(glm5_next, "_gather_rows", lambda group, x, chunk, total: whole)
+    monkeypatch.setattr(glm5_next, "mla_partials", partials)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group=None: 1)
+    monkeypatch.setattr(torch.distributed, "all_to_all_single", all_to_all_single)
+    layer = types.SimpleNamespace(block_type="deepseek_sparse_attention", self_attn=None)
+    ctx = types.SimpleNamespace(config=None, positions=None, cu_seqlens=None, turns=None, replay={}, sp_group=object(),
+                                shard=slice(3, 5), sp_chunk=3, sp_tokens=5, tp=1)  # fmt: skip
+    with torch.no_grad():
+        out = glm5_next._mixer(layer, whole[3:], ctx)
+    assert seen["queries"] == [3, 4, 4]
+    assert torch.equal(out, whole[3:] * 10)
+    assert torch.equal(ctx.replay[id(layer)]["topk"], torch.arange(10).reshape(5, 2)[3:])
 
 
 def test_sequence_parallel_ranks_split_the_tensor_parallel_work_and_every_owner_gets_each_partial_once():
