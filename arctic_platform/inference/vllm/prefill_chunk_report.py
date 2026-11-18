@@ -82,8 +82,9 @@ def chunk_report(request: Any) -> dict[str, Any] | None:
     }
     if getattr(request, "_arctic_preemptions", None):
         report["preemptions"] = list(request._arctic_preemptions)
-        # the blocks of the computation before the first preemption, which its cache hit read: freed since
-        report["start_blocks"] = getattr(request, "_arctic_start_blocks", None) or {}
+        # per computation (one per preemption, and the first), the blocks it held when first scheduled: its cache
+        # hit's pages, freed since for all but the last
+        report["computation_blocks"] = list(getattr(request, "_arctic_computation_blocks", None) or [])
     report.update(getattr(request, "_arctic_blocks", None) or {})
     return report
 
@@ -113,10 +114,15 @@ def ensure_prefill_chunk_report() -> None:
             request = self.requests.get(req_id)
             if request is not None:
                 first = getattr(request, "_arctic_prefill_chunks", None) is None
+                preemptions = len(getattr(request, "_arctic_preemptions", None) or ())
                 record_scheduled_chunk(request, num_scheduled)
-                if first and getattr(request, "_arctic_prefill_chunks", None) is not None:
+                started = first and getattr(request, "_arctic_prefill_chunks", None) is not None
+                if started or len(getattr(request, "_arctic_preemptions", None) or ()) > preemptions:
                     block_ids = self.kv_cache_manager.get_block_ids(req_id)
-                    request._arctic_start_blocks = group_blocks(self.kv_cache_config.kv_cache_groups, block_ids)
+                    computation_blocks = getattr(request, "_arctic_computation_blocks", None)
+                    if computation_blocks is None:
+                        computation_blocks = request._arctic_computation_blocks = []
+                    computation_blocks.append(group_blocks(self.kv_cache_config.kv_cache_groups, block_ids))
         return original_update(self, scheduler_output)
 
     def _free_request(self, request, delay_free_blocks: bool = False):

@@ -57,12 +57,12 @@ def test_a_request_preempted_while_decoding_reports_its_re_prefill_and_where_it_
     record_scheduled_chunk(request, 1760)
     request.num_computed_tokens = 3040
     record_scheduled_chunk(request, 1)
-    request._arctic_start_blocks = {"attention_blocks": [7]}
+    request._arctic_computation_blocks = [{"attention_blocks": [7]}, {"attention_blocks": [9]}]
     assert chunk_report(request) == {
         "chunks": [[0, 2048], [2048, 3000], [1280, 3040]],
         "preempted": True,
         "preemptions": [{"chunk": 2, "tokens": 3041}],
-        "start_blocks": {"attention_blocks": [7]},
+        "computation_blocks": [{"attention_blocks": [7]}, {"attention_blocks": [9]}],
     }
 
 
