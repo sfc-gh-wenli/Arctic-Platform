@@ -43,16 +43,33 @@ def reporting_requested() -> bool:
 
 
 def record_scheduled_chunk(request: Any, num_scheduled_tokens: int) -> None:
-    """Record ``[start, start + n)`` if the scheduled tokens are (part of) the request's prefill."""
+    """Record ``[start, start + n)`` if the scheduled tokens are (part of) the request's prefill.
+
+    A preempted request (a weight sync that clears the prefix cache preempts every running one) recomputes from its
+    new cache hit: it re-prefills its prompt and the tokens it has generated, all but the last, which it decodes. The
+    report then also holds those chunks, and per preemption the index of the first chunk after it and the request's
+    token count at that point (so ``tokens - prompt`` tokens were generated before it)."""
+    if num_scheduled_tokens <= 0:
+        return
     start = int(request.num_computed_tokens)
-    if start >= int(request.num_prompt_tokens) or num_scheduled_tokens <= 0:
+    last_end = getattr(request, "_arctic_last_end", None)
+    request._arctic_last_end = start + int(num_scheduled_tokens)
+    prefill_end = max(int(request.num_prompt_tokens), int(getattr(request, "num_tokens", 0)) - 1)
+    preempted = last_end is not None and start < last_end
+    if start >= prefill_end and not preempted:
         return
     chunks = getattr(request, "_arctic_prefill_chunks", None)
     if chunks is None:
         chunks = request._arctic_prefill_chunks = []
-    if chunks and start < chunks[-1][1]:
+    if preempted:
         request._arctic_preempted = True
-    chunks.append((start, start + int(num_scheduled_tokens)))
+        preemptions = getattr(request, "_arctic_preemptions", None)
+        if preemptions is None:
+            preemptions = request._arctic_preemptions = []
+        tokens = int(getattr(request, "num_tokens", request.num_prompt_tokens))
+        preemptions.append({"chunk": len(chunks), "tokens": tokens})
+    if start < prefill_end:
+        chunks.append((start, start + int(num_scheduled_tokens)))
 
 
 def chunk_report(request: Any) -> dict[str, Any] | None:
@@ -63,6 +80,10 @@ def chunk_report(request: Any) -> dict[str, Any] | None:
         "chunks": [list(chunk) for chunk in chunks],
         "preempted": bool(getattr(request, "_arctic_preempted", False)),
     }
+    if getattr(request, "_arctic_preemptions", None):
+        report["preemptions"] = list(request._arctic_preemptions)
+        # the blocks of the computation before the first preemption, which its cache hit read: freed since
+        report["start_blocks"] = getattr(request, "_arctic_start_blocks", None) or {}
     report.update(getattr(request, "_arctic_blocks", None) or {})
     return report
 
@@ -91,7 +112,11 @@ def ensure_prefill_chunk_report() -> None:
         for req_id, num_scheduled in scheduler_output.num_scheduled_tokens.items():
             request = self.requests.get(req_id)
             if request is not None:
+                first = getattr(request, "_arctic_prefill_chunks", None) is None
                 record_scheduled_chunk(request, num_scheduled)
+                if first and getattr(request, "_arctic_prefill_chunks", None) is not None:
+                    block_ids = self.kv_cache_manager.get_block_ids(req_id)
+                    request._arctic_start_blocks = group_blocks(self.kv_cache_config.kv_cache_groups, block_ids)
         return original_update(self, scheduler_output)
 
     def _free_request(self, request, delay_free_blocks: bool = False):

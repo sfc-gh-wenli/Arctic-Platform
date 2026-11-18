@@ -40,6 +40,32 @@ def test_a_restarted_prefill_is_reported_as_preempted():
     assert chunk_report(request)["preempted"] is True
 
 
+def test_a_request_preempted_while_decoding_reports_its_re_prefill_and_where_it_was_preempted():
+    request = types.SimpleNamespace(num_computed_tokens=0, num_prompt_tokens=3000, num_tokens=3000)
+    record_scheduled_chunk(request, 2048)
+    request.num_computed_tokens = 2048
+    record_scheduled_chunk(request, 952)
+    request.num_computed_tokens = 3000
+    for _ in range(40):  # decode steps: each samples one more token
+        request.num_tokens += 1
+        record_scheduled_chunk(request, 1)
+        request.num_computed_tokens += 1
+    request.num_tokens += 1  # the token the last decode sampled
+    # A weight sync clears the prefix cache: the request recomputes from a 1,280-token hit, re-prefilling its prompt
+    # and every generated token but the last (3,040 of 3,041), then decodes again.
+    request.num_computed_tokens = 1280
+    record_scheduled_chunk(request, 1760)
+    request.num_computed_tokens = 3040
+    record_scheduled_chunk(request, 1)
+    request._arctic_start_blocks = {"attention_blocks": [7]}
+    assert chunk_report(request) == {
+        "chunks": [[0, 2048], [2048, 3000], [1280, 3040]],
+        "preempted": True,
+        "preemptions": [{"chunk": 2, "tokens": 3041}],
+        "start_blocks": {"attention_blocks": [7]},
+    }
+
+
 def test_no_report_for_a_request_that_never_prefilled():
     assert chunk_report(_request(10, 5)) is None
 
