@@ -66,14 +66,20 @@ SP_QUERIES_ENV = "ARCTIC_VLLM_ALIGNED_SP_QUERIES"
 # Default: with sequence parallelism, where a rank keeps only its shard's rows.
 KEEP_OUTPUTS_ENV = "ARCTIC_VLLM_ALIGNED_KEEP_OUTPUTS"
 # "0": the aligned MoE gathers every expert's weights onto every expert-parallel rank instead of sending each
-# (token, expert) pair to the expert's rank (same bits).
+# (token, expert) pair to the expert's rank (same bits); "alternate": one call each way in turn (an A/B in one job).
 MOE_DISPATCH_ENV = "ARCTIC_VLLM_ALIGNED_MOE_DISPATCH"
 # "1": time the forward's and backward's phases with CUDA events; rank 0 logs the totals at the next call.
 PROFILE_ENV = "ARCTIC_VLLM_ALIGNED_PROFILE"
 _PHASE_PREFIX = contextvars.ContextVar("vllm_aligned_phase", default="fwd")
 _PHASES: list = []
 _MARKS: list = []
-_PHASE_TOKENS: list = [0]
+# The current call: its index (the same on every rank), packed tokens and host start time.
+_CALL = {"index": -1, "tokens": 0, "start": 0.0}
+
+
+def _moe_dispatch() -> bool:
+    mode = os.environ.get(MOE_DISPATCH_ENV, "1")
+    return _CALL["index"] % 2 == 0 if mode == "alternate" else mode != "0"
 
 # Set while a layer's backward recomputes the aligned forward with every kernel call differentiable (``vllm_op``).
 _DIFFERENTIABLE = contextvars.ContextVar("vllm_aligned_differentiable", default=False)
@@ -121,8 +127,11 @@ def _mark(t: torch.Tensor, name: str) -> torch.Tensor:
 
 
 def _log_phases(tokens: int) -> None:
-    """Rank 0's phase totals (seconds, nested phases counted in their parents too) since the last call, then starts
-    timing a call of ``tokens`` packed tokens."""
+    """Rank 0's phase totals (seconds, nested phases counted in their parents too) since the last call and the host
+    time from its start to this one's (``call_s``), then starts a call of ``tokens`` packed tokens."""
+    import time
+
+    now = time.perf_counter()
     if _PHASES or _MARKS:
         import collections
         import json
@@ -141,10 +150,12 @@ def _log_phases(tokens: int) -> None:
                 totals[f"bwd.grad.{base}"] += outs.pop(base).elapsed_time(event) / 1000
         _PHASES.clear()
         _MARKS.clear()
+        totals["call_s"] = now - _CALL["start"]
+        totals["moe_dispatch"] = float(_moe_dispatch())
         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-            logging.getLogger(__name__).warning("vllm_aligned profile: tokens=%d %s", _PHASE_TOKENS[0],
+            logging.getLogger(__name__).warning("vllm_aligned profile: tokens=%d %s", _CALL["tokens"],
                                                 json.dumps({k: round(v, 3) for k, v in sorted(totals.items())}))  # fmt: skip
-    _PHASE_TOKENS[0] = tokens
+    _CALL.update(index=_CALL["index"] + 1, tokens=tokens, start=now)
 
 
 def _bind(fn: Callable, static: dict) -> Callable:
@@ -1435,8 +1446,7 @@ def moe(mlp: Any, x: torch.Tensor, config: Any, ep_group: Any = None, record: di
     experts = _routed_experts_ranks
     if (ep_group is not None and torch.distributed.get_world_size(ep_group) > 1
             and not callable(getattr(mlp.experts.w1, "full_tensor", None))
-            and mlp.experts.w1.shape[0] != config.n_routed_experts
-            and os.environ.get(MOE_DISPATCH_ENV, "1") != "0"):  # fmt: skip
+            and mlp.experts.w1.shape[0] != config.n_routed_experts and _moe_dispatch()):  # fmt: skip
         experts = _routed_experts_dispatch
     routed = _op(experts, "ref_routed_experts_ep", x, weights, ids, experts=mlp.experts, moe=mlp,
                  total=config.n_routed_experts, ep_group=ep_group, tp=tp, top_k=config.num_experts_per_tok,

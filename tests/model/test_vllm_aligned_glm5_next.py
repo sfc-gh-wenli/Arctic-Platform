@@ -987,3 +987,17 @@ def test_the_loader_sets_only_the_aligned_forwards_switches():
     assert options.vllm_aligned_env == {"ARCTIC_VLLM_ALIGNED_SP_QUERIES": "0"}
     with pytest.raises(ValidationError, match="ARCTIC_VLLM_ALIGNED_"):
         Glm5NextOptions.model_validate({"vllm_aligned_env": {"NCCL_ALGO": "Ring"}})
+
+
+def test_the_moe_alternates_between_dispatch_and_gather_call_by_call(monkeypatch):
+    from arctic_platform.model.implementations.vllm_aligned import glm5_next
+
+    monkeypatch.setenv(glm5_next.MOE_DISPATCH_ENV, "alternate")
+    monkeypatch.setitem(glm5_next._CALL, "index", -1)
+    seen = []
+    for _ in range(4):
+        glm5_next._log_phases(8)
+        seen.append(glm5_next._moe_dispatch())
+    assert seen == [True, False, True, False]
+    monkeypatch.setenv(glm5_next.MOE_DISPATCH_ENV, "0")
+    assert not glm5_next._moe_dispatch()
