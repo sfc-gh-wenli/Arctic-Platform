@@ -588,13 +588,52 @@ def _sparse_mla_always_mqa() -> None:
     MLAAttention._use_sparse_mha = lambda self, attn_metadata: False
 
 
+def _elementwise_hc_contract() -> None:
+    """``hc_contract`` (the mean of the 4 residual streams after the last layer) as elementwise fp32 adds. vLLM's
+    batch-invariant mean runs one Triton program per output element (6.6 ms at 2,048 tokens, every step); its block
+    sum adds the streams as ``(s0 + s2) + (s1 + s3)``, then divides by 4 and rounds to bf16 once. The same adds give
+    the same bits (checked with magnitudes 2^-40 to 2^12 apart) at 3-30x the speed. The first call outside a CUDA
+    graph capture checks this on such streams and keeps vLLM's mean on any difference."""
+    from vllm.model_executor.determinism import batch_invariant
+    from vllm.model_executor.layers import mhc
+    from vllm.models.glm5next.common import model
+
+    original = mhc.hc_contract
+    state: dict = {"ok": None}
+
+    def fast(x: torch.Tensor) -> torch.Tensor:
+        s = [x[:, i].float() for i in range(4)]
+        return ((0.0 + ((s[0] + s[2]) + (s[1] + s[3]))) / 4).to(x.dtype)
+
+    def check(x: torch.Tensor) -> bool:
+        gen = torch.Generator(device=x.device).manual_seed(0)
+        shape = (2048, 4, x.shape[2])
+        mant = torch.rand(shape, generator=gen, device=x.device) + 1
+        expo = torch.randint(-40, 12, shape, generator=gen, device=x.device).float()
+        sign = torch.randint(0, 2, shape, generator=gen, device=x.device).float() * 2 - 1
+        probe = (sign * mant * torch.exp2(expo)).to(x.dtype)
+        return bool(torch.equal(fast(probe), batch_invariant.mean_batch_invariant(probe, [1])))
+
+    def hc_contract(x: torch.Tensor, n: int) -> torch.Tensor:
+        if x.dim() != 3 or x.shape[1] != 4:
+            return original(x, n)
+        if state["ok"] is None:
+            if torch.cuda.is_current_stream_capturing():
+                return original(x, n)
+            state["ok"] = check(x)
+        return fast(x) if state["ok"] else original(x, n)
+
+    mhc.hc_contract = hc_contract
+    model.hc_contract = hc_contract
+
+
 PROXY_ENV_VAR = "ARCTIC_GLM5_PROXY_LAYERS"
 # Debug, for ablations: comma-separated patches of ``PATCHES`` to leave out. The backend gating always applies.
 SKIP_ENV_VAR = "ARCTIC_GLM5_BI_SKIP"
 PATCHES = ("gdn", "one_split", "mhc_split", "mhc_unfused", "router_gate", "mla_mqa", "fp8_linear", "kda_mixed",
            "indexer_topk", "causal_rows", "indexer_knorm", "indexer_weights", "grouped_topk", "kda_pin",
            "moe_config", "kpool_chunks", "kda_checkpoints", "tp_allreduce", "kda_decode_strides",
-           "nccl_relax")  # fmt: skip
+           "nccl_relax", "hc_contract")  # fmt: skip
 # Patches applied only when their variable is "1". Without tp_allreduce, GLM-5.3-Flash-BF16 at TP 8 gives the same
 # bits on every token (16,377 decoded over 64 batched rows, batch-invariant alone vs. batched) and generates 2.9x
 # faster.
@@ -666,7 +705,8 @@ def ensure_glm5_batch_invariance() -> None:
                         ("indexer_weights", _batch_invariant_indexer_head_weights),
                         ("moe_config", _fixed_fp8_block_moe_config), ("kpool_chunks", _kpool_aligned_chunks),
                         ("kda_checkpoints", _no_kda_prefill_checkpoints), ("tp_allreduce", _fixed_order_tp_all_reduce),
-                        ("kda_decode_strides", _contiguous_kda_decode_inputs), ("nccl_relax", _relaxed_nccl_pins)):  # fmt: skip
+                        ("kda_decode_strides", _contiguous_kda_decode_inputs), ("nccl_relax", _relaxed_nccl_pins),
+                        ("hc_contract", _elementwise_hc_contract)):  # fmt: skip
         if name in OPT_IN and os.environ.get(OPT_IN[name], "0") != "1":
             continue
         if name not in skip:
