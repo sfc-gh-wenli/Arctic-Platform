@@ -65,10 +65,14 @@ SP_QUERIES_ENV = "ARCTIC_VLLM_ALIGNED_SP_QUERIES"
 # "1"/"0": the backward ("vllm") takes the forward's mixer and MoE outputs instead of recomputing them (same values).
 # Default: with sequence parallelism, where a rank keeps only its shard's rows.
 KEEP_OUTPUTS_ENV = "ARCTIC_VLLM_ALIGNED_KEEP_OUTPUTS"
+# "0": the aligned MoE gathers every expert's weights onto every expert-parallel rank instead of sending each
+# (token, expert) pair to the expert's rank (same bits).
+MOE_DISPATCH_ENV = "ARCTIC_VLLM_ALIGNED_MOE_DISPATCH"
 # "1": time the forward's and backward's phases with CUDA events; rank 0 logs the totals at the next call.
 PROFILE_ENV = "ARCTIC_VLLM_ALIGNED_PROFILE"
 _PHASE_PREFIX = contextvars.ContextVar("vllm_aligned_phase", default="fwd")
 _PHASES: list = []
+_MARKS: list = []
 _PHASE_TOKENS: list = [0]
 
 # Set while a layer's backward recomputes the aligned forward with every kernel call differentiable (``vllm_op``).
@@ -101,10 +105,25 @@ def _phase(name: str):
         _PHASES.append((f"{_PHASE_PREFIX.get()}.{name}", start, end))
 
 
+def _mark(t: torch.Tensor, name: str) -> torch.Tensor:
+    """With :data:`PROFILE_ENV`, records when the backward has ``t``'s gradient: from a sublayer's ``.out`` mark to
+    its ``.in`` mark is the sublayer's backward (:func:`_log_phases`)."""
+    if os.environ.get(PROFILE_ENV) == "1" and t.requires_grad:
+
+        def hook(grad):
+            event = torch.cuda.Event(enable_timing=True)
+            event.record()
+            _MARKS.append((name, event))
+            return grad
+
+        t.register_hook(hook)
+    return t
+
+
 def _log_phases(tokens: int) -> None:
     """Rank 0's phase totals (seconds, nested phases counted in their parents too) since the last call, then starts
     timing a call of ``tokens`` packed tokens."""
-    if _PHASES:
+    if _PHASES or _MARKS:
         import collections
         import json
         import logging
@@ -113,7 +132,15 @@ def _log_phases(tokens: int) -> None:
         totals: dict = collections.defaultdict(float)
         for name, start, end in _PHASES:
             totals[name] += start.elapsed_time(end) / 1000
+        outs: dict = {}
+        for name, event in _MARKS:
+            base, end = name.rsplit(".", 1)
+            if end == "out":
+                outs[base] = event
+            elif base in outs:
+                totals[f"bwd.grad.{base}"] += outs.pop(base).elapsed_time(event) / 1000
         _PHASES.clear()
+        _MARKS.clear()
         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
             logging.getLogger(__name__).warning("vllm_aligned profile: tokens=%d %s", _PHASE_TOKENS[0],
                                                 json.dumps({k: round(v, 3) for k, v in sorted(totals.items())}))  # fmt: skip
@@ -1405,7 +1432,13 @@ def moe(mlp: Any, x: torch.Tensor, config: Any, ep_group: Any = None, record: di
         shared = shared_expert_partials(mlp.shared_expert, x, config.swiglu_limit, tp)
         reference = tp_sum(shared) + stock_routed_experts(mlp, x, ids, weights).to(x.dtype)
         return substitute(reference, record.pop("out"))
-    routed = _op(_routed_experts_ranks, "ref_routed_experts_ep", x, weights, ids, experts=mlp.experts, moe=mlp,
+    experts = _routed_experts_ranks
+    if (ep_group is not None and torch.distributed.get_world_size(ep_group) > 1
+            and not callable(getattr(mlp.experts.w1, "full_tensor", None))
+            and mlp.experts.w1.shape[0] != config.n_routed_experts
+            and os.environ.get(MOE_DISPATCH_ENV, "1") != "0"):  # fmt: skip
+        experts = _routed_experts_dispatch
+    routed = _op(experts, "ref_routed_experts_ep", x, weights, ids, experts=mlp.experts, moe=mlp,
                  total=config.n_routed_experts, ep_group=ep_group, tp=tp, top_k=config.num_experts_per_tok,
                  limit=config.swiglu_limit)  # fmt: skip
     shared = shared_expert_partials(mlp.shared_expert, x, config.swiglu_limit, tp)
@@ -1431,6 +1464,62 @@ def _routed_experts_ranks(x, weights, ids, *, experts: Any, total: int, ep_group
         w13_scale = None if s1_r is None else torch.cat([s1_r, s3_r], dim=1)
         out.append(_routed_experts_kernel(x, weights, ids, w13, w13_scale, w2_r, s2_r, top_k=top_k, limit=limit))
     return tuple(out)
+
+
+def _routed_experts_dispatch(x, weights, ids, *, experts: Any, total: int, ep_group: Any, tp: int, top_k: int,
+                             limit: float) -> tuple[torch.Tensor, ...]:  # fmt: skip
+    """:func:`_routed_experts_ranks` without gathering the experts. vLLM's fused experts compute each (token, expert)
+    pair's output on its own row, in bf16, and end with ``moe_sum`` over the token's top-k slots. So each pair goes
+    to the expert-parallel rank holding its expert, which runs the same kernel on it as a top-1 token on every
+    tensor-parallel rank's shard of its experts and sends the outputs back; each TP rank's ``moe_sum`` then runs here,
+    over the slots in the token's order. A few rows per pair move instead of every expert's weights."""
+    dist = torch.distributed
+    world, me = dist.get_world_size(ep_group), dist.get_rank(ep_group)
+    local, (tokens, hidden) = experts.w1.shape[0], x.shape
+    flat = ids.reshape(-1)
+    owner = flat.long() // local
+    order = torch.argsort(owner, stable=True)
+    send_counts = torch.bincount(owner, minlength=world)
+    recv_counts = torch.empty_like(send_counts)
+    dist.all_to_all_single(recv_counts, send_counts, group=ep_group)
+    send, recv = send_counts.tolist(), recv_counts.tolist()
+
+    def exchange(t: torch.Tensor, out_splits: list[int], in_splits: list[int]) -> torch.Tensor:
+        out = t.new_empty((sum(in_splits), *t.shape[1:]))
+        dist.all_to_all_single(out, t.contiguous(), in_splits, out_splits, group=ep_group)
+        return out
+
+    rows = exchange(x[order // top_k], send, recv)
+    local_ids = exchange(flat[order], send, recv) - me * local
+    pair_weights = exchange(weights.reshape(-1)[order], send, recv)
+    scales = [getattr(experts, f"{w}_scale_inv", None) for w in ("w1", "w2", "w3")]
+    outs = []
+    for rank in range(tp):
+        (w1_r, s1_r), (w3_r, s3_r) = (_shard(getattr(experts, w), s, tp, rank, 1)
+                                      for w, s in (("w1", scales[0]), ("w3", scales[2])))  # fmt: skip
+        w2_r, s2_r = _shard(experts.w2, scales[1], tp, rank, 2)
+        w13 = torch.cat([w1_r, w3_r], dim=1)
+        w13_scale = None if s1_r is None else torch.cat([s1_r, s3_r], dim=1)
+        if rows.shape[0] == 0:
+            outs.append(rows.new_empty((0, hidden)))
+            continue
+        outs.append(_routed_experts_kernel(rows, pair_weights[:, None], local_ids[:, None], w13, w13_scale, w2_r, s2_r,
+                                           top_k=1, limit=limit))  # fmt: skip
+    back = exchange(torch.stack(outs, 1).reshape(-1, tp * hidden), recv, send)
+    pairs = torch.empty_like(back)
+    pairs[order] = back
+    pairs = pairs.view(tokens, top_k, tp, hidden)
+    return tuple(_moe_sum(pairs[:, :, rank].contiguous()) for rank in range(tp))
+
+
+def _moe_sum(pairs: torch.Tensor) -> torch.Tensor:
+    """vLLM's ``moe_sum`` of ``[tokens, top_k, hidden]`` pair outputs, the fused experts' last step."""
+    from vllm import _custom_ops as vllm_ops
+
+    out = pairs.new_empty((pairs.shape[0], pairs.shape[2]))
+    if pairs.shape[0]:
+        vllm_ops.moe_sum(pairs, out)
+    return out
 
 
 def stock_routed_experts(moe: Any, x: torch.Tensor, ids: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
@@ -1741,10 +1830,12 @@ def _vllm_backward_runner(input_ids: torch.Tensor, position_ids: torch.Tensor, k
     def run(layer: Any, streams: torch.Tensor) -> torch.Tensor:
         record = _record(ctx, layer) or {}
         fused, post, comb, x, exact = pre(layer, layer.attn_hc, layer.input_layernorm, streams)
+        mixer = f"{'per_op' if 'mixer' in per_op else 'stock'}.mixer.{layer.block_type}"
+        x = _mark(x, f"{mixer}.in")
         with _stock_replay(layer, record, kwargs, vllm_mla_weights=True) as extra:
             if "mixer" in per_op:
                 with differentiable(), _phase(f"per_op.mixer.{layer.block_type}"):
-                    mixed = _mixer(layer, x, ctx)
+                    mixed = _mark(_mixer(layer, x, ctx), f"{mixer}.out")
                 mixed_exact = mixed.detach()
             else:
                 mixed_exact = record.pop("mixer_out", None)  # the forward's (ctx.keep_mixer_out)
@@ -1761,9 +1852,11 @@ def _vllm_backward_runner(input_ids: torch.Tensor, position_ids: torch.Tensor, k
                                                    "attention_mask": mask, "position_ids": position_ids.reshape(1, -1),
                                                    "past_key_values": None, "use_cache": False,
                                                    "position_embeddings": None, "prev_topk_indices": None})[0]  # fmt: skip
-                mixed = substitute(mixed.squeeze(0), mixed_exact)
+                mixed = _mark(substitute(mixed.squeeze(0), mixed_exact), f"{mixer}.out")
             streams = post_(layer, fused, post, comb, mixed, mixed_exact, streams, exact)
             fused, post, comb, x, exact = pre(layer, layer.ffn_hc, layer.post_attention_layernorm, streams)
+            mlp = "mlp.moe" if hasattr(layer.mlp, "experts") else "mlp.dense"
+            x = _mark(x, f"{mlp}.in")
             if "mlp" in per_op:
                 with differentiable():
                     out = _mlp(layer, x, ctx)
@@ -1777,7 +1870,7 @@ def _vllm_backward_runner(input_ids: torch.Tensor, position_ids: torch.Tensor, k
                     out = layer.mlp(x.unsqueeze(0), routed_experts=extra["routed_experts"][:, :, layer._replay_layer_idx])
                 else:
                     out = layer.mlp(x.unsqueeze(0))
-            out = substitute(out.squeeze(0), mlp_exact)
+            out = _mark(substitute(out.squeeze(0), mlp_exact), f"{mlp}.out")
             return post_(layer, fused, post, comb, out, mlp_exact, streams, exact)
 
     return run
