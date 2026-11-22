@@ -73,6 +73,23 @@ def _batch_invariant():
     return batch_invariant
 
 
+# "1": the bf16 linears and LM head on cuBLASLt, as the sampler runs them with ARCTIC_GLM5_CUBLASLT_LINEAR=1. Needs
+# CUBLASLT_WORKSPACE_SIZE=1 from the process's start (no split-K, so the same bits at every row count).
+CUBLASLT_ENV = "ARCTIC_VLLM_ALIGNED_CUBLASLT"
+
+
+def _bi_linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
+    """The sampler's batch-invariant bf16 linear: vLLM's Triton persistent matmul, or cuBLASLt (:data:`CUBLASLT_ENV`)."""
+    if os.environ.get(CUBLASLT_ENV) == "1":
+        if os.environ.get("CUBLASLT_WORKSPACE_SIZE") != "1":
+            raise RuntimeError(f"{CUBLASLT_ENV}=1 needs CUBLASLT_WORKSPACE_SIZE=1 in the trainer's environment")
+        torch.backends.cuda.preferred_blas_library(backend="cublaslt")
+        return torch.nn.functional.linear(x, weight, bias)
+    if bias is None:
+        return _batch_invariant().linear_batch_invariant(x, weight)
+    return _batch_invariant().linear_batch_invariant(x, weight, bias)
+
+
 def _custom_ops():
     from vllm import _custom_ops
 
@@ -99,7 +116,7 @@ class _Linear(torch.autograd.Function):
     def forward(ctx, x, weight, bias):
         ctx.save_for_backward(x, weight)
         ctx.has_bias = bias is not None
-        return _batch_invariant().linear_batch_invariant(x, weight, bias)
+        return _bi_linear(x, weight, bias)
 
     @staticmethod
     def backward(ctx, grad_out):
@@ -281,7 +298,7 @@ def silu_and_mul_kernel(x: torch.Tensor) -> torch.Tensor:
 
 def linear_kernel(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
     """The forward of :func:`linear` without autograd."""
-    return _batch_invariant().linear_batch_invariant(x, weight, bias)
+    return _bi_linear(x, weight, bias)
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float, *, fused: bool) -> torch.Tensor:
@@ -619,7 +636,7 @@ def lm_head_logprobs_kernel(
     tensor_parallel: int = 1,
 ) -> torch.Tensor:
     """The forward of :func:`lm_head_logprobs` without autograd; ``labels`` must be valid token ids."""
-    head = _fp32_logits_linear() if fp32 else _batch_invariant().linear_batch_invariant
+    head = _fp32_logits_linear() if fp32 else _bi_linear
     vocab_size = weight.shape[0]
     padded = _padded_vocab(vocab_size, vocab_padding)
     if padded % tensor_parallel:

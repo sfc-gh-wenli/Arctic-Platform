@@ -155,7 +155,41 @@ def _log_phases(tokens: int) -> None:
         if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
             logging.getLogger(__name__).warning("vllm_aligned profile: tokens=%d %s", _CALL["tokens"],
                                                 json.dumps({k: round(v, 3) for k, v in sorted(totals.items())}))  # fmt: skip
+    _torch_profile_step(_CALL["index"] + 1)
     _CALL.update(index=_CALL["index"] + 1, tokens=tokens, start=now)
+
+
+# Comma-separated call indices: rank 0 runs torch.profiler from each such call's start to the next call's (its
+# forward and backward) and logs the top operations and kernels by device time.
+TORCH_PROFILE_ENV = "ARCTIC_VLLM_ALIGNED_TORCH_PROFILE"
+_TORCH_PROFILER: list = []
+
+
+def _torch_profile_step(index: int) -> None:
+    """Ends the running capture (logging it) and starts one if call ``index`` is listed in :data:`TORCH_PROFILE_ENV`."""
+    wanted = {int(i) for i in os.environ.get(TORCH_PROFILE_ENV, "").split(",") if i.strip()}
+    if not wanted or (torch.distributed.is_initialized() and torch.distributed.get_rank() != 0):
+        return
+    if _TORCH_PROFILER:
+        import json
+        import logging
+
+        prof, started = _TORCH_PROFILER.pop()
+        torch.cuda.synchronize()
+        prof.__exit__(None, None, None)
+        rows = []
+        for e in prof.key_averages():
+            device = getattr(e, "device_time_total", None)
+            device = getattr(e, "cuda_time_total", 0) if device is None else device
+            rows.append({"name": e.key[:90], "device_ms": round(device / 1000, 2), "calls": e.count})
+        rows.sort(key=lambda r: -r["device_ms"])
+        logging.getLogger(__name__).warning("vllm_aligned kernels: call=%d tokens=%d %s", started, _CALL["tokens"],
+                                            json.dumps(rows[:60]))  # fmt: skip
+    if index in wanted:
+        prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
+                                                  torch.profiler.ProfilerActivity.CUDA])  # fmt: skip
+        prof.__enter__()
+        _TORCH_PROFILER.append((prof, index))
 
 
 def _bind(fn: Callable, static: dict) -> Callable:
