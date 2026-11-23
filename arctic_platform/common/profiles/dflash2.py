@@ -56,6 +56,7 @@ def register(registry: Registry) -> None:
             "numerics.fp32_residual": "this loader has no fp32_residual option; only huggingface has one",
             "numerics.vllm_aligned": "this loader has no vllm_aligned option; only huggingface has one",
             "numerics.fp32_routed_weighting": "the draft has no routed experts",
+            "numerics.fp32_kda": "the draft has no KDA layers",
             "liger": "the loader rejects `patches.liger`",
             "compile.fullgraph": "the loader rejects `patches.compile`",
             "peft": "the loader rejects `patches.peft`: the draft is trained in full",
