@@ -644,18 +644,26 @@ def _cublaslt_linear() -> None:
     )
 
 
+def _fixed_order_allreduce() -> None:
+    """Large tensor-parallel all-reduces on a two-stage custom all-reduce with the one-stage kernel's bits
+    (:mod:`arctic_platform.inference.vllm.fixed_order_allreduce`)."""
+    from arctic_platform.inference.vllm.fixed_order_allreduce import patch_custom_allreduce
+
+    patch_custom_allreduce()
+
+
 PROXY_ENV_VAR = "ARCTIC_GLM5_PROXY_LAYERS"
 # Debug, for ablations: comma-separated patches of ``PATCHES`` to leave out. The backend gating always applies.
 SKIP_ENV_VAR = "ARCTIC_GLM5_BI_SKIP"
 PATCHES = ("gdn", "one_split", "mhc_split", "mhc_unfused", "router_gate", "mla_mqa", "fp8_linear", "kda_mixed",
            "indexer_topk", "causal_rows", "indexer_knorm", "indexer_weights", "grouped_topk", "kda_pin",
            "moe_config", "kpool_chunks", "kda_checkpoints", "tp_allreduce", "kda_decode_strides",
-           "nccl_relax", "hc_contract", "cublaslt_linear")  # fmt: skip
+           "nccl_relax", "hc_contract", "cublaslt_linear", "fixed_ar")  # fmt: skip
 # Patches applied only when their variable is "1". Without tp_allreduce, GLM-5.3-Flash-BF16 at TP 8 gives the same
 # bits on every token (16,377 decoded over 64 batched rows, batch-invariant alone vs. batched) and generates 2.9x
 # faster.
 OPT_IN = {"tp_allreduce": "ARCTIC_GLM5_TP_ALLREDUCE", "nccl_relax": "ARCTIC_GLM5_NCCL_RELAX",
-          "cublaslt_linear": "ARCTIC_GLM5_CUBLASLT_LINEAR"}  # fmt: skip
+          "cublaslt_linear": "ARCTIC_GLM5_CUBLASLT_LINEAR", "fixed_ar": "ARCTIC_GLM5_FIXED_AR"}  # fmt: skip
 
 
 def _load_proxy_layers_only(num_layers: int) -> None:
@@ -724,7 +732,8 @@ def ensure_glm5_batch_invariance() -> None:
                         ("moe_config", _fixed_fp8_block_moe_config), ("kpool_chunks", _kpool_aligned_chunks),
                         ("kda_checkpoints", _no_kda_prefill_checkpoints), ("tp_allreduce", _fixed_order_tp_all_reduce),
                         ("kda_decode_strides", _contiguous_kda_decode_inputs), ("nccl_relax", _relaxed_nccl_pins),
-                        ("hc_contract", _elementwise_hc_contract), ("cublaslt_linear", _cublaslt_linear)):  # fmt: skip
+                        ("hc_contract", _elementwise_hc_contract), ("cublaslt_linear", _cublaslt_linear),
+                        ("fixed_ar", _fixed_order_allreduce)):  # fmt: skip
         if name in OPT_IN and os.environ.get(OPT_IN[name], "0") != "1":
             continue
         if name not in skip:
