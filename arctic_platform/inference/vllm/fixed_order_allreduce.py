@@ -248,16 +248,30 @@ def patch_custom_allreduce() -> None:
     when vLLM's batch-invariant mode has pinned the one-stage kernel."""
     from vllm.distributed.device_communicators import custom_all_reduce
 
+    import logging
+
+    log = logging.getLogger(__name__)
     cls = custom_all_reduce.CustomAllreduce
     original = cls._all_reduce_chunk
     min_bytes = int(os.environ.get(MIN_BYTES_ENV, DEFAULT_MIN_BYTES))
+    seen = {"fixed": False, "one_stage": False}
 
     def _all_reduce_chunk(self, inp, out, registered):
         if (getattr(self, "batch_invariant", False) and inp.dtype in (torch.bfloat16, torch.float32)
                 and inp.numel() * inp.element_size() >= min_bytes and inp.is_contiguous() and out.is_contiguous()
                 and self.world_size in (2, 4, 8)):  # fmt: skip
+            if not seen["fixed"]:
+                seen["fixed"] = True
+                log.warning("fixed-order all-reduce: first call, %d bytes, rank %d", inp.numel() * inp.element_size(),
+                            self.rank)  # fmt: skip
             fixed_order_all_reduce(self, inp, out)
             return
+        if not seen["one_stage"]:
+            seen["one_stage"] = True
+            log.warning("fixed-order all-reduce: first one-stage call, %d bytes, batch_invariant=%s",
+                        inp.numel() * inp.element_size(), getattr(self, "batch_invariant", None))  # fmt: skip
         original(self, inp, out, registered)
 
     cls._all_reduce_chunk = _all_reduce_chunk
+    log.warning("fixed-order all-reduce: patched CustomAllreduce (chunks of %d bytes and more), pid %d", min_bytes,
+                os.getpid())  # fmt: skip
