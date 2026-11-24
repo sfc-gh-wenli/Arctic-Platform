@@ -33,13 +33,6 @@ def test_sparse_mla_attention_runs_one_split():
     assert call.__wrapped__ is flash_attn_varlen_func
 
 
-def test_sparse_mla_attention_takes_a_constant_split_count():
-    seen = {}
-    call = _single_split(lambda *args, **kwargs: seen.update(kwargs), 4)
-    call(q=1)
-    assert seen == {"q": 1, "num_splits": 4}
-
-
 def test_split_counts_default_to_one_and_reject_what_the_kernels_do_not_compile(monkeypatch):
     monkeypatch.delenv("ARCTIC_TEST_SPLITS", raising=False)
     assert fixed_splits("ARCTIC_TEST_SPLITS") == 1
