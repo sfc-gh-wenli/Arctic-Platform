@@ -34,10 +34,10 @@ from typing import Any
 
 import torch
 
-# Chunks of at least this many bytes take the two-stage kernel (faster from 512 KiB at 8 H200s: 1.1x, 2.5x at 8 MiB); smaller ones keep
+# Chunks of at least this many bytes take the two-stage kernel (at 8 H200s: 1.06x at 256 KiB, 2.7x at 8 MiB); smaller ones keep
 # the one-stage kernel, which gives the same bits.
 MIN_BYTES_ENV = "ARCTIC_GLM5_FIXED_AR_MIN_BYTES"
-DEFAULT_MIN_BYTES = 512 * 1024
+DEFAULT_MIN_BYTES = 256 * 1024
 
 _SOURCE = r"""
 #include <cuda.h>
@@ -144,7 +144,7 @@ DINLINE P packed_reduce(const P* ptrs[], int idx) {
 
 // vLLM's cross_device_reduce_2stage, with the reduce-scatter reading the ranks in order 0, 1, ... (vLLM rotates
 // them to start at the own rank): the one-stage kernel's order for every element, whatever the size.
-template <typename T, int ngpus>
+template <typename T, int ngpus, int ILP>
 __global__ void __launch_bounds__(512, 1)
     fixed_order_2stage(RankData dp, RankSignals sg, Signal* self_sg, T* __restrict__ result, int rank, int size) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -165,15 +165,29 @@ __global__ void __launch_bounds__(512, 1)
   }
   auto tmp_out = tmps[0];
   barrier_at_start<ngpus>(sg, self_sg, rank);
-  for (int idx = start + tid; idx < end; idx += stride) tmp_out[idx - start] = packed_reduce<P, ngpus, A>(ptrs, idx);
+  // ILP packets per thread per iteration: their loads are issued before any sum waits on them. Each packet's sum is
+  // packed_reduce's, so the bits do not depend on ILP.
+  int idx = start + tid;
+  for (; idx + (ILP - 1) * stride < end; idx += ILP * stride) {
+    P v[ILP];
+#pragma unroll
+    for (int u = 0; u < ILP; u++) v[u] = packed_reduce<P, ngpus, A>(ptrs, idx + u * stride);
+#pragma unroll
+    for (int u = 0; u < ILP; u++) tmp_out[idx + u * stride - start] = v[u];
+  }
+  for (; idx < end; idx += stride) tmp_out[idx - start] = packed_reduce<P, ngpus, A>(ptrs, idx);
   barrier_at_end<ngpus>(sg, self_sg, rank);
   for (int idx = tid; idx < largest_part; idx += stride) {
+    P v[ngpus];
 #pragma unroll
     for (int i = 0; i < ngpus; i++) {
       int gather_from_rank = (rank + i) % ngpus;
-      if (gather_from_rank == ngpus - 1 || idx < part) {
-        ((P*)result)[gather_from_rank * part + idx] = tmps[i][idx];
-      }
+      if (gather_from_rank == ngpus - 1 || idx < part) v[i] = tmps[i][idx];
+    }
+#pragma unroll
+    for (int i = 0; i < ngpus; i++) {
+      int gather_from_rank = (rank + i) % ngpus;
+      if (gather_from_rank == ngpus - 1 || idx < part) ((P*)result)[gather_from_rank * part + idx] = v[i];
     }
   }
 }
@@ -205,9 +219,9 @@ void fixed_order_allreduce(torch::Tensor inp, torch::Tensor out, std::vector<int
     int blocks = std::min(kMaxBlocks, (size + threads - 1) / threads);
     T* result = reinterpret_cast<T*>(out.data_ptr());
     switch (world) {
-      case 2: fixed_order_2stage<T, 2><<<blocks, threads, 0, stream>>>(dp, sg, self_sg, result, rank, size); break;
-      case 4: fixed_order_2stage<T, 4><<<blocks, threads, 0, stream>>>(dp, sg, self_sg, result, rank, size); break;
-      case 8: fixed_order_2stage<T, 8><<<blocks, threads, 0, stream>>>(dp, sg, self_sg, result, rank, size); break;
+      case 2: fixed_order_2stage<T, 2, 4><<<blocks, threads, 0, stream>>>(dp, sg, self_sg, result, rank, size); break;
+      case 4: fixed_order_2stage<T, 4, 4><<<blocks, threads, 0, stream>>>(dp, sg, self_sg, result, rank, size); break;
+      case 8: fixed_order_2stage<T, 8, 4><<<blocks, threads, 0, stream>>>(dp, sg, self_sg, result, rank, size); break;
       default: TORCH_CHECK(false, "2, 4 or 8 ranks");
     }
   };
@@ -232,7 +246,7 @@ def _module() -> Any:
         if not os.environ.get("TORCH_CUDA_ARCH_LIST"):
             major, minor = torch.cuda.get_device_capability()
             os.environ["TORCH_CUDA_ARCH_LIST"] = f"{major}.{minor}"
-        _MODULE.append(load_inline(name="arctic_fixed_order_allreduce", cpp_sources=_DECLARATION, cuda_sources=_SOURCE,
+        _MODULE.append(load_inline(name="arctic_fixed_order_allreduce_v3", cpp_sources=_DECLARATION, cuda_sources=_SOURCE,
                                    functions=["fixed_order_allreduce"], extra_cuda_cflags=["-O3"], verbose=False))  # fmt: skip
     return _MODULE[0]
 
