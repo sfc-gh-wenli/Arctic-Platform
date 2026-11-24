@@ -121,6 +121,10 @@ def _ordered_sum(x: torch.Tensor) -> torch.Tensor:
     return total.unsqueeze(-1)
 
 
+# "1": a single-group biased router runs as one Triton kernel (router_topk); the trainer's MoE calls this function too.
+FUSED_ROUTER_ENV = "ARCTIC_GLM5_FUSED_ROUTER"
+
+
 def grouped_topk(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -139,22 +143,32 @@ def grouped_topk(
         scores = gating_output.sigmoid()
     else:
         raise ValueError(f"Unsupported scoring function: {scoring_func}")
+    if os.environ.get(FUSED_ROUTER_ENV) == "1":
+        from arctic_platform.inference.vllm import router_topk
+
+        if router_topk.supported(scores, topk, num_expert_group, topk_group, e_score_correction_bias):
+            return router_topk.router_topk(scores, e_score_correction_bias, topk, renormalize, routed_scaling_factor)
     num_token = scores.size(0)
     if e_score_correction_bias is not None:
         original_scores = scores
         scores = scores + e_score_correction_bias.unsqueeze(0)
-        top2 = scores.view(num_token, num_expert_group, -1).topk(2, dim=-1, sorted=True)[0]
-        group_scores = top2[..., 0] + top2[..., 1]
+    if num_expert_group <= 1:
+        # One group keeps every expert: the group selection below would mask nothing.
+        tmp_scores = scores
     else:
-        group_scores = scores.view(num_token, num_expert_group, -1).max(dim=-1).values
-    group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=True)[1]
-    group_mask = torch.zeros_like(group_scores).scatter_(1, group_idx, 1)
-    score_mask = (
-        group_mask.unsqueeze(-1)
-        .expand(num_token, num_expert_group, scores.size(-1) // num_expert_group)
-        .reshape(num_token, -1)
-    )
-    tmp_scores = scores.masked_fill(~score_mask.bool(), float("-inf"))
+        if e_score_correction_bias is not None:
+            top2 = scores.view(num_token, num_expert_group, -1).topk(2, dim=-1, sorted=True)[0]
+            group_scores = top2[..., 0] + top2[..., 1]
+        else:
+            group_scores = scores.view(num_token, num_expert_group, -1).max(dim=-1).values
+        group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=True)[1]
+        group_mask = torch.zeros_like(group_scores).scatter_(1, group_idx, 1)
+        score_mask = (
+            group_mask.unsqueeze(-1)
+            .expand(num_token, num_expert_group, scores.size(-1) // num_expert_group)
+            .reshape(num_token, -1)
+        )
+        tmp_scores = scores.masked_fill(~score_mask.bool(), float("-inf"))
     if e_score_correction_bias is not None:
         topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=True)[1]
         topk_weights = original_scores.gather(1, topk_ids)
@@ -168,9 +182,6 @@ def grouped_topk(
 
 
 TRITON_TOPK_ENV = "ARCTIC_GLM5_TRITON_TOPK"
-# GLM-5.3-Flash's indexer (k = 512 pools): 32 rows x 2,048 pools 58 us against 231 us, 64 x 4,096 144 against 219; a
-# prefill's 8,192 rows take 3.0 ms against 1.8 ms.
-TRITON_TOPK_MAX_ROWS = 256
 
 
 def deterministic_topk(
@@ -181,14 +192,14 @@ def deterministic_topk(
     Every score is made unique by its column, so equal scores go to the later column and the selected set never
     depends on thread scheduling; the selection is written in descending order with ``-1`` for missing entries.
 
-    With ``ARCTIC_GLM5_TRITON_TOPK=1`` a decode-sized call runs one Triton program per row instead, with the same
-    output (:mod:`arctic_platform.inference.vllm.deterministic_topk`).
+    With ``ARCTIC_GLM5_TRITON_TOPK=1`` the keys are built in one Triton pass and the final sort runs on int32 columns,
+    with the same output (:mod:`arctic_platform.inference.vllm.deterministic_topk`): GLM-5.3-Flash's indexer (k = 512
+    pools) 1.45x faster at 32 rows x 4,096 pools, 1.75x at a prefill's 8,192 x 4,096.
     """
-    if os.environ.get(TRITON_TOPK_ENV) == "1" and logits.shape[0] <= TRITON_TOPK_MAX_ROWS:
+    if os.environ.get(TRITON_TOPK_ENV) == "1" and logits.is_cuda and logits.dim() == 2 and logits.stride(1) == 1:
         from arctic_platform.inference.vllm import deterministic_topk as triton_topk
 
-        if triton_topk.supported(logits, out):
-            return triton_topk.deterministic_topk_triton(logits, starts, ends, k, out)
+        return triton_topk.deterministic_topk_keys(logits, starts, ends, k, out)
     rows, cols = logits.shape
     col = torch.arange(cols, device=logits.device)
     valid = (col[None, :] >= starts[:, None].long()) & (col[None, :] < ends[:, None].long())
