@@ -20,11 +20,21 @@ The fp32 LM head computes ``torch.mm(hidden, weight.t(), out_dtype=torch.float32
 function runs vLLM's batch-invariant persistent kernel on the bf16/fp16 operands with the tile configuration of a
 bf16/fp16 output and stores the fp32 accumulator without the final cast. A row's logits then depend only on the
 row, and a trainer that calls the same function reproduces them.
+
+With ``ARCTIC_GLM5_FP32_GEMM_CUBLASLT=1`` calls of four rows or more take cuBLASLt instead: with the one-byte workspace
+vLLM's batch-invariant mode sets on Hopper (no split-K) it gives the persistent kernel's bits on GLM-5.3-Flash's
+router (4096 x 256), indexer head weights (4096 x 32) and TP 8 LM-head shard (4096 x 18,944) at every row count from 4
+to 16,384, 1.4-4x faster. Below four rows it takes another kernel for a 32-column output, whose bits differ.
 """
 
 from __future__ import annotations
 
+import os
+
 import torch
+
+CUBLASLT_ENV = "ARCTIC_GLM5_FP32_GEMM_CUBLASLT"
+CUBLASLT_MIN_ROWS = 4
 
 
 def _default_config(dtype: torch.dtype, batch_invariant) -> dict:
@@ -51,6 +61,8 @@ def matmul_fp32_out(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
     if a.shape[1] != b.shape[0] or a.dtype != b.dtype:
         raise ValueError(f"incompatible operands {tuple(a.shape)} {a.dtype} @ {tuple(b.shape)} {b.dtype}")
+    if os.environ.get(CUBLASLT_ENV) == "1" and a.is_cuda and a.shape[0] >= CUBLASLT_MIN_ROWS:
+        return torch.mm(a, b, out_dtype=torch.float32)
     num_sms = batch_invariant.num_compute_units(a.device.index)
     M, K = a.shape
     N = b.shape[1]
