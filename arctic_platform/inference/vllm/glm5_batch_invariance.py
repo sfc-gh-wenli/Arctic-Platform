@@ -167,6 +167,12 @@ def grouped_topk(
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
 
+TRITON_TOPK_ENV = "ARCTIC_GLM5_TRITON_TOPK"
+# GLM-5.3-Flash's indexer (k = 512 pools): 32 rows x 2,048 pools 58 us against 231 us, 64 x 4,096 144 against 219; a
+# prefill's 8,192 rows take 3.0 ms against 1.8 ms.
+TRITON_TOPK_MAX_ROWS = 256
+
+
 def deterministic_topk(
     logits: torch.Tensor, starts: torch.Tensor, ends: torch.Tensor, k: int, out: torch.Tensor
 ) -> torch.Tensor:
@@ -174,7 +180,15 @@ def deterministic_topk(
 
     Every score is made unique by its column, so equal scores go to the later column and the selected set never
     depends on thread scheduling; the selection is written in descending order with ``-1`` for missing entries.
+
+    With ``ARCTIC_GLM5_TRITON_TOPK=1`` a decode-sized call runs one Triton program per row instead, with the same
+    output (:mod:`arctic_platform.inference.vllm.deterministic_topk`).
     """
+    if os.environ.get(TRITON_TOPK_ENV) == "1" and logits.shape[0] <= TRITON_TOPK_MAX_ROWS:
+        from arctic_platform.inference.vllm import deterministic_topk as triton_topk
+
+        if triton_topk.supported(logits, out):
+            return triton_topk.deterministic_topk_triton(logits, starts, ends, k, out)
     rows, cols = logits.shape
     col = torch.arange(cols, device=logits.device)
     valid = (col[None, :] >= starts[:, None].long()) & (col[None, :] < ends[:, None].long())

@@ -94,6 +94,19 @@ def test_deterministic_topk_breaks_ties_by_column_and_orders_descending():
     assert torch.equal(a.sort(dim=-1, descending=True).values, a)
 
 
+def test_triton_topk_opt_in_keeps_the_composition_off_cuda(monkeypatch):
+    import torch
+
+    from arctic_platform.inference.vllm import deterministic_topk as triton_topk
+    from arctic_platform.inference.vllm.glm5_batch_invariance import deterministic_topk
+
+    monkeypatch.setenv("ARCTIC_GLM5_TRITON_TOPK", "1")
+    logits = torch.tensor([[0.5, 2.0, 2.0, -1.0, 2.0, 0.0]])
+    out = torch.empty(1, 3, dtype=torch.int32)
+    assert not triton_topk.supported(logits, out)
+    assert deterministic_topk(logits, torch.tensor([0]), torch.tensor([6]), 3, out).tolist() == [[4, 2, 1]]
+
+
 def test_indexer_head_weights_use_the_batch_invariant_matmul(monkeypatch):
     import sys
     import types
