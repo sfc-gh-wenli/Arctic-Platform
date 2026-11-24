@@ -68,6 +68,10 @@ KEEP_OUTPUTS_ENV = "ARCTIC_VLLM_ALIGNED_KEEP_OUTPUTS"
 # "0": the aligned MoE gathers every expert's weights onto every expert-parallel rank instead of sending each
 # (token, expert) pair to the expert's rank (same bits); "alternate": one call each way in turn (an A/B in one job).
 MOE_DISPATCH_ENV = "ARCTIC_VLLM_ALIGNED_MOE_DISPATCH"
+# The sampler's constant split counts for the sparse-MLA attention and the hyper-connection pre-norm GEMM
+# (glm5_batch_invariance); the trainer must be given the same ones.
+SPLITS_ENVS = {"ARCTIC_VLLM_ALIGNED_FA_SPLITS": "ARCTIC_GLM5_FA_SPLITS",
+               "ARCTIC_VLLM_ALIGNED_MHC_SPLITS": "ARCTIC_GLM5_MHC_SPLITS"}  # fmt: skip
 # "1": time the forward's and backward's phases with CUDA events; rank 0 logs the totals at the next call.
 PROFILE_ENV = "ARCTIC_VLLM_ALIGNED_PROFILE"
 _PHASE_PREFIX = contextvars.ContextVar("vllm_aligned_phase", default="fwd")
@@ -2289,6 +2293,10 @@ def apply_vllm_aligned_glm5_next(model: Any, *, token_chunk_size: int, lm_head_f
     import os
 
     os.environ.setdefault("ARCTIC_GLM5_BATCH_INVARIANT", "1")
+    # The loader passes only ARCTIC_VLLM_ALIGNED_* variables; the sampler's split counts must reach the same patches.
+    for ours, sampler in SPLITS_ENVS.items():
+        if ours in os.environ:
+            os.environ[sampler] = os.environ[ours]
     ensure_glm5_batch_invariance()
     model._vllm_aligned_ep_group = ep_group
     model._vllm_aligned_tensor_parallel = int(tensor_parallel)

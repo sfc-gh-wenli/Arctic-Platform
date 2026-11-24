@@ -69,9 +69,25 @@ def pin_kda_kernels() -> int:
     return pinned
 
 
-def _single_split(flash_attn_varlen_func):
+FA_SPLITS_ENV = "ARCTIC_GLM5_FA_SPLITS"
+MHC_SPLITS_ENV = "ARCTIC_GLM5_MHC_SPLITS"
+MHC_SPLIT_BUCKETS = (1, 4, 16)  # the split counts vLLM's hyper-connection kernels compile
+
+
+def fixed_splits(env: str, allowed: tuple[int, ...] | None = None) -> int:
+    """The split count ``env`` asks for (1 by default). Any constant is batch-invariant: a query's or token's partial
+    sums then cover the same ranges and are combined in the same order whatever else the step holds."""
+    splits = int(os.environ.get(env, "1"))
+    if splits < 1 or (allowed is not None and splits not in allowed):
+        raise ValueError(f"{env}={splits}: expected {'one of ' + str(allowed) if allowed else 'a positive count'}")
+    return splits
+
+
+def _single_split(flash_attn_varlen_func, splits: int = 1):
+    # The sparse MLA backend calls with a constant max_seqlen_k (the top-k buffer width), so a constant split count
+    # cuts each query's keys at the same places in every step.
     def call(*args, **kwargs):
-        kwargs["num_splits"] = 1
+        kwargs["num_splits"] = splits
         return flash_attn_varlen_func(*args, **kwargs)
 
     call.__wrapped__ = flash_attn_varlen_func
@@ -708,16 +724,18 @@ def ensure_glm5_batch_invariance() -> None:
     ):
         backend.supports_batch_invariance = classmethod(lambda cls: True)
     if "one_split" not in skip:
-        flashattn_mla_sparse.flash_attn_varlen_func = _single_split(flashattn_mla_sparse.flash_attn_varlen_func)
+        flashattn_mla_sparse.flash_attn_varlen_func = _single_split(flashattn_mla_sparse.flash_attn_varlen_func,
+                                                                    fixed_splits(FA_SPLITS_ENV))  # fmt: skip
     from vllm.model_executor.kernels.mhc import tilelang_kernels
     from vllm.model_executor.kernels.mhc import warmup
 
     if "mhc_split" not in skip:
         # The hyper-connection pre-norm GEMM splits its reduction by the step's token count; callers import these
-        # from both modules at call time.
+        # from both modules at call time. The fused epilogue is compiled per split count, so both give one bucket.
+        mhc_splits = fixed_splits(MHC_SPLITS_ENV, MHC_SPLIT_BUCKETS)
         for module in (tilelang_kernels, warmup):
-            module.compute_num_split = lambda *args, **kwargs: 1
-            module.compute_mhc_pre_num_splits = lambda *args, **kwargs: 1
+            module.compute_num_split = lambda *args, **kwargs: mhc_splits
+            module.compute_mhc_pre_num_splits = lambda *args, **kwargs: mhc_splits
     if "mhc_unfused" not in skip:
         # Small steps would take a fused post + pre-norm kernel with its own split; every step takes the split-free
         # path. The fused kernel then has no compile keys, so the kernel warm-up (run with CUDA graphs) must not ask

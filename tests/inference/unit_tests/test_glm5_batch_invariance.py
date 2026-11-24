@@ -13,7 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
+
+from arctic_platform.inference.vllm.glm5_batch_invariance import MHC_SPLIT_BUCKETS
 from arctic_platform.inference.vllm.glm5_batch_invariance import _single_split
+from arctic_platform.inference.vllm.glm5_batch_invariance import fixed_splits
 
 
 def test_sparse_mla_attention_runs_one_split():
@@ -27,6 +31,27 @@ def test_sparse_mla_attention_runs_one_split():
     assert call(q=1, num_splits=0) == "out"
     assert seen == {"q": 1, "num_splits": 1}
     assert call.__wrapped__ is flash_attn_varlen_func
+
+
+def test_sparse_mla_attention_takes_a_constant_split_count():
+    seen = {}
+    call = _single_split(lambda *args, **kwargs: seen.update(kwargs), 4)
+    call(q=1)
+    assert seen == {"q": 1, "num_splits": 4}
+
+
+def test_split_counts_default_to_one_and_reject_what_the_kernels_do_not_compile(monkeypatch):
+    monkeypatch.delenv("ARCTIC_TEST_SPLITS", raising=False)
+    assert fixed_splits("ARCTIC_TEST_SPLITS") == 1
+    monkeypatch.setenv("ARCTIC_TEST_SPLITS", "16")
+    assert fixed_splits("ARCTIC_TEST_SPLITS", MHC_SPLIT_BUCKETS) == 16
+    monkeypatch.setenv("ARCTIC_TEST_SPLITS", "8")
+    assert fixed_splits("ARCTIC_TEST_SPLITS") == 8
+    with pytest.raises(ValueError):
+        fixed_splits("ARCTIC_TEST_SPLITS", MHC_SPLIT_BUCKETS)
+    monkeypatch.setenv("ARCTIC_TEST_SPLITS", "0")
+    with pytest.raises(ValueError):
+        fixed_splits("ARCTIC_TEST_SPLITS")
 
 
 def test_grouped_topk_is_row_invariant_and_matches_the_reference_math():
