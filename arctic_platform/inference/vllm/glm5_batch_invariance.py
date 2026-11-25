@@ -790,4 +790,7 @@ def ensure_glm5_batch_invariance() -> None:
         grouped_topk_router.grouped_topk = grouped_topk
     if "kda_pin" not in skip:
         pin_kda_kernels()
+    from arctic_platform.inference.vllm import sampler_profile
+
+    sampler_profile.install()
     _APPLIED = True

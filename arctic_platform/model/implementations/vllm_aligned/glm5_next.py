@@ -73,8 +73,12 @@ MOE_DISPATCH_ENV = "ARCTIC_VLLM_ALIGNED_MOE_DISPATCH"
 SPLITS_ENVS = {"ARCTIC_VLLM_ALIGNED_MHC_SPLITS": "ARCTIC_GLM5_MHC_SPLITS",
                "ARCTIC_VLLM_ALIGNED_FUSED_ROUTER": "ARCTIC_GLM5_FUSED_ROUTER",
                "ARCTIC_VLLM_ALIGNED_TRITON_TOPK": "ARCTIC_GLM5_TRITON_TOPK"}  # fmt: skip
-# "1": time the forward's and backward's phases with CUDA events; rank 0 logs the totals at the next call.
+# "1": time the forward's and backward's phases with CUDA events; rank 0 logs the totals at the next call ("all":
+# every rank also logs its own, to find the slowest data-parallel rank).
 PROFILE_ENV = "ARCTIC_VLLM_ALIGNED_PROFILE"
+# "1": pin every FLA Triton autotuner to its first config. The backward's KDA references run FLA's chunk_kda, whose
+# autotuners benchmark each new shape on first contact (varlen turn-plan rows keep bringing new ones).
+PIN_FLA_ENV = "ARCTIC_VLLM_ALIGNED_PIN_FLA"
 _PHASE_PREFIX = contextvars.ContextVar("vllm_aligned_phase", default="fwd")
 _PHASES: list = []
 _MARKS: list = []
@@ -104,7 +108,7 @@ def differentiable():
 @contextlib.contextmanager
 def _phase(name: str):
     """With :data:`PROFILE_ENV`, times the block on the current stream (:func:`_log_phases` reports it)."""
-    if os.environ.get(PROFILE_ENV) != "1":
+    if os.environ.get(PROFILE_ENV) not in ("1", "all"):
         yield
         return
     start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
@@ -119,7 +123,7 @@ def _phase(name: str):
 def _mark(t: torch.Tensor, name: str) -> torch.Tensor:
     """With :data:`PROFILE_ENV`, records when the backward has ``t``'s gradient: from a sublayer's ``.out`` mark to
     its ``.in`` mark is the sublayer's backward (:func:`_log_phases`)."""
-    if os.environ.get(PROFILE_ENV) == "1" and t.requires_grad:
+    if os.environ.get(PROFILE_ENV) in ("1", "all") and t.requires_grad:
 
         def hook(grad):
             event = torch.cuda.Event(enable_timing=True)
@@ -157,9 +161,13 @@ def _log_phases(tokens: int) -> None:
         _MARKS.clear()
         totals["call_s"] = now - _CALL["start"]
         totals["moe_dispatch"] = float(_moe_dispatch())
-        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-            logging.getLogger(__name__).warning("vllm_aligned profile: tokens=%d %s", _CALL["tokens"],
-                                                json.dumps({k: round(v, 3) for k, v in sorted(totals.items())}))  # fmt: skip
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        line = json.dumps({k: round(v, 3) for k, v in sorted(totals.items())})
+        if rank == 0:
+            logging.getLogger(__name__).warning("vllm_aligned profile: tokens=%d %s", _CALL["tokens"], line)
+        if os.environ.get(PROFILE_ENV) == "all":
+            logging.getLogger(__name__).warning("vllm_aligned rank profile: rank=%d tokens=%d %s", rank, _CALL["tokens"],
+                                                line)  # fmt: skip
     _torch_profile_step(_CALL["index"] + 1)
     _CALL.update(index=_CALL["index"] + 1, tokens=tokens, start=now)
 
@@ -2253,6 +2261,22 @@ def check_tensor_parallel(config: Any, tp: int, fp8: bool = True) -> None:
             raise ValueError(f"{name} {size} does not split across {tp} ranks" + (f" in {block}-blocks" if fp8 else ""))
 
 
+def _pin_fla_autotuners() -> int:
+    """Pin every Triton autotuner in the loaded ``fla`` modules to its first config (after FLA's KDA ops are imported)."""
+    import logging
+    import sys
+
+    import fla.ops.kda  # noqa: F401
+    from triton.runtime.autotuner import Autotuner
+
+    from arctic_platform.inference.vllm.gdn_batch_invariance import _pin_autotuner
+
+    pinned = sum(_pin_autotuner(obj, Autotuner) for name, module in list(sys.modules.items())
+                 if module is not None and (name == "fla" or name.startswith("fla.")) for obj in list(vars(module).values()))  # fmt: skip
+    logging.getLogger(__name__).warning("vllm_aligned: pinned %d FLA autotuners to their first config", pinned)
+    return pinned
+
+
 def apply_vllm_aligned_glm5_next(model: Any, *, token_chunk_size: int, lm_head_fp32: bool = False,
                                  ep_group: Any = None, tensor_parallel: int = 1, backward: str = "vllm",
                                  prefill_chunk: int = 0, kv_block_size: int = 0, sp_group: Any = None) -> None:  # fmt: skip
@@ -2299,6 +2323,8 @@ def apply_vllm_aligned_glm5_next(model: Any, *, token_chunk_size: int, lm_head_f
         if ours in os.environ:
             os.environ[sampler] = os.environ[ours]
     ensure_glm5_batch_invariance()
+    if os.environ.get(PIN_FLA_ENV) == "1":
+        _pin_fla_autotuners()
     model._vllm_aligned_ep_group = ep_group
     model._vllm_aligned_tensor_parallel = int(tensor_parallel)
     model._vllm_aligned_backward = backward
