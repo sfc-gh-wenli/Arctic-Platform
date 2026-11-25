@@ -18,8 +18,8 @@
 ``ARCTIC_GLM5_SAMPLER_PROFILE=skip,steps,kernel_steps[,mixed]`` skips ``skip`` engine steps, then for ``steps`` steps records
 each step's scheduled tokens and requests, whether it decodes only, its GPU time (CUDA events from the start of
 ``execute_model`` to the end of ``sample_tokens``, read once at the end) and its wall time and the gap before it; the
-last ``kernel_steps`` steps also run under ``torch.profiler`` (with ``mixed``: kernels are collected only during the
-window's steps that prefill, with a device sync at each switch). The summary (per step kind and batch size, and the
+last ``kernel_steps`` steps also run under ``torch.profiler`` (with ``mixed``: kernels and host ops are collected only
+during the window's steps that prefill, with a device sync at each switch; the host ops are listed by self time). The summary (per step kind and batch size, and the
 top kernels) is logged as ``arctic sampler profile: {json}``.
 """
 
@@ -71,6 +71,9 @@ def _summary(rows: list, prof) -> dict:
         events = sorted(prof.key_averages(), key=lambda e: -getattr(e, "device_time_total", 0))
         out["kernels"] = [{"name": e.key[:80], "calls": e.count, "ms": round(e.device_time_total / 1e3, 1)}
                           for e in events[:40] if getattr(e, "device_time_total", 0) > 0]  # fmt: skip
+        host = sorted(prof.key_averages(), key=lambda e: -getattr(e, "self_cpu_time_total", 0))
+        out["host_ops"] = [{"name": e.key[:80], "calls": e.count, "self_ms": round(e.self_cpu_time_total / 1e3, 1)}
+                           for e in host[:50] if getattr(e, "self_cpu_time_total", 0) > 0]  # fmt: skip
     return out
 
 
@@ -107,14 +110,15 @@ def install() -> None:
             meta = {"tokens": int(scheduler_output.total_num_scheduled_tokens), "reqs": len(counts),
                     "decode": all(v == 1 for v in counts.values())}  # fmt: skip
             in_kernels = n >= skip + steps - kernel_steps
+            activities = [torch.profiler.ProfilerActivity.CUDA] + ([torch.profiler.ProfilerActivity.CPU] if mixed_only else [])
             if in_kernels and state["prof"] is None:
-                state["prof"] = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA])
+                state["prof"] = torch.profiler.profile(activities=activities)
                 state["prof"].__enter__()
                 state["collecting"] = True
             if in_kernels and mixed_only and state.get("collecting") != (not meta["decode"]):
                 torch.cuda.synchronize()
                 state["collecting"] = not meta["decode"]
-                state["prof"].toggle_collection_dynamic(state["collecting"], [torch.profiler.ProfilerActivity.CUDA])
+                state["prof"].toggle_collection_dynamic(state["collecting"], activities)
             start = torch.cuda.Event(enable_timing=True)
             start.record()
             state["open"] = (meta, start, time.perf_counter())
