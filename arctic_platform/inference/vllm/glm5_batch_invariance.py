@@ -697,6 +697,32 @@ def _cublaslt_linear() -> None:
     )
 
 
+PREFILL_INTERVAL_ENV = "ARCTIC_GLM5_PREFILL_INTERVAL"
+
+
+def _prefill_cadence() -> None:
+    """Admit prefills only every ``ARCTIC_GLM5_PREFILL_INTERVAL`` engine steps (vLLM's DP prefill throttle, which the
+    single-engine core never turns on): decodes run every step, and the turns that arrive in between start together.
+
+    A step that prefills runs eager (the sparse-MLA and KDA backends capture only uniform decode batches) and, at
+    TP 8 with ~30 decoding rows, costs ~140 ms of mostly host time against ~20 ms for a decode step, whatever its
+    prefill size; fewer, larger mixed steps spend less of it. vLLM lifts the throttle while waiting requests pile up
+    (``prefill_capacity_bound``). The chunks a turn plan records are whatever ran, so matching is unaffected."""
+    interval = int(os.environ.get(PREFILL_INTERVAL_ENV, "0"))
+    if interval <= 1:
+        return
+    from vllm.v1.engine.core import EngineCore
+
+    original = EngineCore._should_throttle_prefills
+    steps = {"n": 0}
+
+    def _should_throttle_prefills(self):
+        steps["n"] += 1
+        return original(self) or steps["n"] % interval != 0
+
+    EngineCore._should_throttle_prefills = _should_throttle_prefills
+
+
 def _fixed_order_allreduce() -> None:
     """Large tensor-parallel all-reduces on a two-stage custom all-reduce with the one-stage kernel's bits
     (:mod:`arctic_platform.inference.vllm.fixed_order_allreduce`)."""
@@ -805,4 +831,5 @@ def ensure_glm5_batch_invariance() -> None:
     from arctic_platform.inference.vllm import sampler_profile
 
     sampler_profile.install()
+    _prefill_cadence()
     _APPLIED = True
