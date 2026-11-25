@@ -396,11 +396,7 @@ def _split_mixed_kda_steps() -> None:
 
     original = Glm5NextLinearAttention._forward
 
-    def _forward(self, qkv_proj_states, g1, beta, core_attn_out):
-        raw = get_forward_context().attn_metadata
-        md = raw.get(self.prefix) if isinstance(raw, dict) else None
-        if md is None or md.spec_sequence_masks is not None or not (md.num_prefills > 0 and md.num_decodes > 0):
-            return original(self, qkv_proj_states, g1, beta, core_attn_out)
+    def split(md):
         d, n = md.num_decode_tokens, md.num_actual_tokens
         decode = dataclasses.replace(
             md,
@@ -429,6 +425,22 @@ def _split_mixed_kda_steps() -> None:
             token_chunk_offset_ptr=token_chunk_offset_ptr,
             checkpoint=_prefill_checkpoint(md.checkpoint, md.num_decodes),
         )
+        return decode, prefill
+
+    def _forward(self, qkv_proj_states, g1, beta, core_attn_out):
+        context = get_forward_context()
+        raw = context.attn_metadata
+        md = raw.get(self.prefix) if isinstance(raw, dict) else None
+        if md is None or md.spec_sequence_masks is not None or not (md.num_prefills > 0 and md.num_decodes > 0):
+            return original(self, qkv_proj_states, g1, beta, core_attn_out)
+        d, n = md.num_decode_tokens, md.num_actual_tokens
+        # The KDA layers of a step share its metadata; the split (and the host copy of the prefill boundaries it
+        # needs) is done once per step instead of once per layer, which kept the host waiting on the GPU 33 times.
+        cache = context.__dict__.setdefault("_arctic_kda_split", {})
+        key = (id(md.non_spec_query_start_loc), id(md.prefill_query_start_loc), id(md.non_spec_state_indices_tensor))
+        if key not in cache:
+            cache[key] = split(md)
+        decode, prefill = cache[key]
         try:
             raw[self.prefix] = decode
             original(self, qkv_proj_states[:d], g1[:, :d], beta[:, :d], core_attn_out[:, :d])
