@@ -15,10 +15,11 @@
 
 """Debug: profile a window of engine steps in a running sampler (TP rank 0) and log one summary line.
 
-``ARCTIC_GLM5_SAMPLER_PROFILE=skip,steps,kernel_steps`` skips ``skip`` engine steps, then for ``steps`` steps records
+``ARCTIC_GLM5_SAMPLER_PROFILE=skip,steps,kernel_steps[,mixed]`` skips ``skip`` engine steps, then for ``steps`` steps records
 each step's scheduled tokens and requests, whether it decodes only, its GPU time (CUDA events from the start of
 ``execute_model`` to the end of ``sample_tokens``, read once at the end) and its wall time and the gap before it; the
-last ``kernel_steps`` steps also run under ``torch.profiler``. The summary (per step kind and batch size, and the
+last ``kernel_steps`` steps also run under ``torch.profiler`` (with ``mixed``: kernels are collected only during the
+window's steps that prefill, with a device sync at each switch). The summary (per step kind and batch size, and the
 top kernels) is logged as ``arctic sampler profile: {json}``.
 """
 
@@ -77,7 +78,9 @@ def install() -> None:
     spec = os.environ.get(ENV)
     if not spec:
         return
-    skip, steps, kernel_steps = (int(v) for v in spec.split(","))
+    fields = spec.split(",")
+    skip, steps, kernel_steps = (int(v) for v in fields[:3])
+    mixed_only = len(fields) > 3 and fields[3] == "mixed"
     from vllm.distributed import get_tp_group
     from vllm.v1.worker import gpu_worker
 
@@ -100,12 +103,18 @@ def install() -> None:
         n = state["n"]
         state["n"] += 1
         if skip <= n < skip + steps and scheduler_output.total_num_scheduled_tokens > 0:
-            if n >= skip + steps - kernel_steps and state["prof"] is None:
-                state["prof"] = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA])
-                state["prof"].__enter__()
             counts = scheduler_output.num_scheduled_tokens
             meta = {"tokens": int(scheduler_output.total_num_scheduled_tokens), "reqs": len(counts),
                     "decode": all(v == 1 for v in counts.values())}  # fmt: skip
+            in_kernels = n >= skip + steps - kernel_steps
+            if in_kernels and state["prof"] is None:
+                state["prof"] = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA])
+                state["prof"].__enter__()
+                state["collecting"] = True
+            if in_kernels and mixed_only and state.get("collecting") != (not meta["decode"]):
+                torch.cuda.synchronize()
+                state["collecting"] = not meta["decode"]
+                state["prof"].toggle_collection_dynamic(state["collecting"], [torch.profiler.ProfilerActivity.CUDA])
             start = torch.cuda.Event(enable_timing=True)
             start.record()
             state["open"] = (meta, start, time.perf_counter())
