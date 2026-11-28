@@ -35,7 +35,7 @@ def _keys_kernel():
 
     @triton.jit
     def topk_keys_kernel(logits_ptr, starts_ptr, ends_ptr, keys_ptr, cols, stride_row, BLOCK: tl.constexpr):
-        row = tl.program_id(0)
+        row = tl.program_id(0).to(tl.int64)  # a long row's indexer scores pass 2**31 elements
         col = tl.program_id(1).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
         start = tl.load(starts_ptr + row).to(tl.int64)
         end = tl.load(ends_ptr + row).to(tl.int64)
@@ -45,7 +45,7 @@ def _keys_kernel():
         bits = score.to(tl.int32, bitcast=True).to(tl.int64)
         ordered = tl.where(bits >= 0, bits, bits ^ 0x7FFFFFFF)
         key = tl.where(valid, (ordered << 32) | col, -9223372036854775808)
-        tl.store(keys_ptr + row.to(tl.int64) * cols + col, key, mask=inside)
+        tl.store(keys_ptr + row * cols + col, key, mask=inside)
 
     return topk_keys_kernel
 
